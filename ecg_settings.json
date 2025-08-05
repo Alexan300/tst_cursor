@@ -1,0 +1,11 @@
+{
+  "notch_enabled": true,
+  "bandpass_enabled": true,
+  "lowpass_enabled": false,
+  "highpass_enabled": false,
+  "bandpass_low": 0.5,
+  "bandpass_high": 100.0,
+  "lowpass_cutoff": 100.0,
+  "highpass_cutoff": 0.5,
+  "annotations": []
+}

@@ -1,4 +1,4 @@
-# какая версия пуша?
+# какая версия пуша?1
 import sys
 import numpy as np
 import matplotlib.pyplot as plt

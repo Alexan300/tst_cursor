@@ -90,15 +90,6 @@ class ECGApp(tk.Tk):
         filemenu.add_separator()
         filemenu.add_command(label="Выход", command=lambda: on_close(self))
         menubar.add_cascade(label="Файл", menu=filemenu)
-        
-        # Новое меню настроек
-        settingsmenu = tk.Menu(menubar, tearoff=0)
-        settingsmenu.add_command(label="Notch 50 Hz", command=self.toggle_notch)
-        settingsmenu.add_command(label="Выделить регион", command=self.activate_region_selector)
-        settingsmenu.add_command(label="Отметить комплекс", command=self.toggle_peak_selector)
-        settingsmenu.add_command(label="Выбрать комплекс", command=self.toggle_select_complex)
-        menubar.add_cascade(label="Настройки", menu=settingsmenu)
-        
         self.config(menu=menubar)
 
         # --- Данные и состояния ---
@@ -113,12 +104,18 @@ class ECGApp(tk.Tk):
         self.select_beats = False
         self.select_complex_mode = False
         self.selected_idx = None
+        
+        # --- Параметры масштабирования времени ---
+        self.time_scale = 1.0        # коэффициент масштабирования времени
+        self.time_center = 0.0       # центр временного окна
+        self.time_window = 50.0      # размер временного окна в секундах
 
         # --- Разметка grid ---
         self.rowconfigure(0, weight=3)
-        self.rowconfigure(1, weight=2)
+        self.rowconfigure(1, weight=0)  # панель управления масштабом
         self.rowconfigure(2, weight=2)
-        self.rowconfigure(3, weight=0)
+        self.rowconfigure(3, weight=2)
+        self.rowconfigure(4, weight=0)
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
 
@@ -129,6 +126,24 @@ class ECGApp(tk.Tk):
         self.canvas_raw.get_tk_widget().grid(row=0, column=0, columnspan=2, sticky='nsew')
         self.hr_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="ЧСС: -- bpm", background='#fff')
         self.hr_label.place(relx=0.01, rely=0.01)
+
+        # --- Панель управления масштабом времени ---
+        scale_frame = ttk.Frame(self)
+        scale_frame.grid(row=1, column=0, columnspan=2, sticky='ew', padx=5, pady=2)
+        
+        ttk.Label(scale_frame, text="Масштаб времени:").pack(side='left', padx=(0,5))
+        
+        self.scale_var = tk.DoubleVar(value=1.0)
+        self.time_scale_slider = ttk.Scale(scale_frame, from_=0.1, to=10.0, 
+                                          variable=self.scale_var, orient='horizontal',
+                                          command=self.on_time_scale_change)
+        self.time_scale_slider.pack(side='left', fill='x', expand=True, padx=5)
+        
+        self.scale_label = ttk.Label(scale_frame, text="1.0x")
+        self.scale_label.pack(side='left', padx=5)
+        
+        ttk.Button(scale_frame, text="Сброс", command=self.reset_time_scale).pack(side='left', padx=5)
+        ttk.Button(scale_frame, text="Весь сигнал", command=self.show_full_signal).pack(side='left', padx=5)
 
         # SpanSelector и события мыши
         self.span = SpanSelector(self.ax_raw, self.onselect_region, 'horizontal', useblit=True,
@@ -142,25 +157,67 @@ class ECGApp(tk.Tk):
         self.fig_avg, self.ax_avg = plt.subplots(figsize=(4,2))
         plt.tight_layout()
         self.canvas_avg = FigureCanvasTkAgg(self.fig_avg, master=self)
-        self.canvas_avg.get_tk_widget().grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
+        self.canvas_avg.get_tk_widget().grid(row=2, column=0, sticky='nsew', padx=5, pady=5)
 
         # --- Спектр ---
         self.fig_sp, self.ax_sp = plt.subplots(figsize=(4,2))
         plt.tight_layout()
         self.canvas_sp = FigureCanvasTkAgg(self.fig_sp, master=self)
-        self.canvas_sp.get_tk_widget().grid(row=1, column=1, sticky='nsew', padx=5, pady=5)
+        self.canvas_sp.get_tk_widget().grid(row=2, column=1, sticky='nsew', padx=5, pady=5)
 
         # --- Выбранный комплекс ---
         self.fig_sel, self.ax_sel = plt.subplots(figsize=(8,2))
         plt.tight_layout()
         self.canvas_sel = FigureCanvasTkAgg(self.fig_sel, master=self)
-        self.canvas_sel.get_tk_widget().grid(row=2, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
+        self.canvas_sel.get_tk_widget().grid(row=3, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
-        # --- Панель кнопок (упрощённая) ---
+        # --- Панель кнопок ---
         ctrl = ttk.Frame(self)
-        ctrl.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        ctrl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        ttk.Button(ctrl, text='Notch 50 Hz', command=self.toggle_notch).pack(side='left', padx=5)
+        ttk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector).pack(side='left', padx=5)
+        ttk.Button(ctrl, text='Отметить комплекс', command=self.toggle_peak_selector).pack(side='left', padx=5)
+        ttk.Button(ctrl, text='Выбрать комплекс', command=self.toggle_select_complex).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Обновить', command=self.compute).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Copy Screenshot', command=self.copy_screenshot).pack(side='left', padx=5)
+
+    # --- Методы управления масштабом времени ---
+    def on_time_scale_change(self, value):
+        self.time_scale = float(value)
+        self.scale_label.config(text=f"{self.time_scale:.1f}x")
+        self.update_time_window()
+        self.draw_raw()
+
+    def reset_time_scale(self):
+        self.time_scale = 1.0
+        self.time_center = 0.0
+        self.scale_var.set(1.0)
+        self.scale_label.config(text="1.0x")
+        self.update_time_window()
+        self.draw_raw()
+
+    def show_full_signal(self):
+        if self.ecg is not None:
+            self.time_scale = 1.0
+            self.time_center = len(self.ecg) / FS / 2
+            self.scale_var.set(1.0)
+            self.scale_label.config(text="1.0x")
+            self.update_time_window()
+            self.draw_raw()
+
+    def update_time_window(self):
+        """Обновляет размер временного окна на основе масштаба"""
+        if self.ecg is not None:
+            total_time = len(self.ecg) / FS
+            self.time_window = total_time / self.time_scale
+            # Ограничиваем окно размером сигнала
+            self.time_window = min(self.time_window, total_time)
+            # Центрируем окно, если оно выходит за границы
+            half_window = self.time_window / 2
+            if self.time_center - half_window < 0:
+                self.time_center = half_window
+            elif self.time_center + half_window > total_time:
+                self.time_center = total_time - half_window
 
     # --- Методы GUI ---
     def open_file(self):
@@ -170,6 +227,7 @@ class ECGApp(tk.Tk):
         try:
             self.mm, self.total = open_ecg_memmap(fn)
             self.clear_markup()
+            self.reset_time_scale()
         except Exception as e:
             messagebox.showerror('Ошибка', str(e))
 
@@ -281,6 +339,7 @@ class ECGApp(tk.Tk):
         else:
             self.hr_label.config(text="ЧСС: -- bpm")
 
+        self.update_time_window()
         self.draw_raw()
         
         allb = np.unique(np.concatenate([good, list(self.manual_beats)])).astype(int)
@@ -303,17 +362,50 @@ class ECGApp(tk.Tk):
             mask = xf <= 150
             self.ax_sp.plot(xf[mask], amp[mask], linewidth=1)
         self.ax_sp.set_title('Спектр усреднённого комплекса')
+        self.ax_sp.set_xlabel('Частота (Гц)')
+        self.ax_sp.set_ylabel('Амплитуда')
         self.canvas_sp.draw()
 
         self.draw_selected()
 
     def draw_raw(self):
         self.ax_raw.cla()
+        if self.ecg is None:
+            return
+            
         t = np.arange(len(self.ecg)) / FS
-        self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
-        self.ax_raw.plot(self.r_peaks/FS, self.ecg[self.r_peaks], 'ro', markersize=3)
+        
+        # Применяем масштабирование времени
+        if self.time_scale != 1.0:
+            half_window = self.time_window / 2
+            start_time = max(0, self.time_center - half_window)
+            end_time = min(len(self.ecg) / FS, self.time_center + half_window)
+            
+            start_idx = int(start_time * FS)
+            end_idx = int(end_time * FS)
+            
+            t_visible = t[start_idx:end_idx]
+            ecg_visible = self.ecg[start_idx:end_idx]
+            
+            # Фильтруем пики в видимой области
+            visible_peaks = self.r_peaks[(self.r_peaks >= start_idx) & (self.r_peaks < end_idx)]
+            
+            self.ax_raw.plot(t_visible, ecg_visible, color='black', linewidth=0.8)
+            if len(visible_peaks) > 0:
+                self.ax_raw.plot(visible_peaks/FS, self.ecg[visible_peaks], 'ro', markersize=3)
+        else:
+            # Показываем весь сигнал
+            self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
+            self.ax_raw.plot(self.r_peaks/FS, self.ecg[self.r_peaks], 'ro', markersize=3)
+        
+        # Добавляем патчи регионов
         for patch in self.region_patches:
             self.ax_raw.add_patch(patch)
+            
+        self.ax_raw.set_xlabel('Время (с)')
+        self.ax_raw.set_ylabel('Амплитуда (мВ)')
+        self.ax_raw.set_title(f'ECG сигнал (масштаб: {self.time_scale:.1f}x)')
+        self.ax_raw.grid(True, alpha=0.3)
         self.canvas_raw.draw()
 
     def draw_selected(self):
@@ -325,6 +417,9 @@ class ECGApp(tk.Tk):
             tseg = np.linspace(-half/FS, half/FS, len(seg))
             self.ax_sel.plot(tseg, seg, color='green')
         self.ax_sel.set_title('Выбранный комплекс')
+        self.ax_sel.set_xlabel('Время (с)')
+        self.ax_sel.set_ylabel('Амплитуда (мВ)')
+        self.ax_sel.grid(True, alpha=0.3)
         self.canvas_sel.draw()
 
     def copy_screenshot(self):

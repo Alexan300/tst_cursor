@@ -12,10 +12,14 @@ import io
 import win32clipboard
 import win32con
 from datetime import datetime
+import threading
+import queue
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 # === Параметры сигнала ===
 FS = 2000.0  # Полная частота дискретизации для математики
-FS_DISPLAY = 200.0  # Пониженная частота для отрисовки
+FS_DISPLAY = 2000.0  # Полная частота для отрисовки
 BYTES_ECG = 3
 BYTES_AUX = 2 * 4
 N_CHANNELS = 8
@@ -110,6 +114,11 @@ def downsample_for_display(data, fs_original, fs_target):
     
     # Простое понижение частоты дискретизации (каждый N-й сэмпл)
     return data[::downsample_factor]
+
+def reduce_amplitude_resolution(data, factor=5):
+    """Снижение разрешения по амплитуде для ускорения отрисовки"""
+    # Округляем значения до factor знаков после запятой
+    return np.round(data / factor) * factor
 
 def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, search_window_ms=50, notch_enabled=True):
     """
@@ -279,6 +288,9 @@ def copy_image_to_clipboard(img):
 
 
 def on_close(app):
+    # Очищаем ресурсы
+    if hasattr(app, 'executor'):
+        app.executor.shutdown(wait=False)
     plt.close('all')
     app.destroy()
     sys.exit(0)
@@ -345,6 +357,25 @@ class ECGApp(tk.Tk):
         self.t_avg_data = None
         self.avg_data = None
         
+        # Кэш для ускорения отрисовки
+        self._peak_cache = None
+        self._cache_valid = False
+        
+        # Переменные для навигации по записи
+        self.current_position = 0  # текущая позиция в секундах
+        self.display_duration = 100  # длительность отображаемого фрагмента в секундах
+        
+        # Система кэширования и оптимизации
+        self.cache = {}  # Кэш для обработанных фрагментов
+        self.cache_lock = threading.Lock()
+        self.processing_queue = queue.Queue()
+        self.display_queue = queue.Queue()
+        self.processing_thread = None
+        self.last_update_time = 0
+        self.update_interval = 0.1  # Обновление каждые 100мс
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.is_processing = False
+        
         # --- Параметры алгоритма Томсона ---
         self.sensitivity = tk.DoubleVar(value=1.0)
         self.min_rr_ms = tk.IntVar(value=200)
@@ -353,20 +384,39 @@ class ECGApp(tk.Tk):
         self.auto_recompute = tk.BooleanVar(value=False)  # Контроль автоматического пересчета
 
         # --- Разметка grid ---
-        self.rowconfigure(0, weight=3)
-        self.rowconfigure(1, weight=2)
-        self.rowconfigure(2, weight=2)
-        self.rowconfigure(3, weight=1)
-        self.rowconfigure(4, weight=1)
-        self.rowconfigure(5, weight=0)
+        self.rowconfigure(0, weight=3)  # Raw ECG
+        self.rowconfigure(1, weight=0)  # Панель инструментов matplotlib
+        self.rowconfigure(2, weight=2)  # Усредненный комплекс и спектр
+        self.rowconfigure(3, weight=2)  # Выбранный комплекс
+        self.rowconfigure(4, weight=1)  # Текстовое поле
+        self.rowconfigure(5, weight=0)  # Панель кнопок
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
 
-        # --- Raw ECG и HR ---
-        self.fig_raw, self.ax_raw = plt.subplots(figsize=(8,2))
+        # --- Raw ECG с встроенной навигацией matplotlib ---
+        self.fig_raw, self.ax_raw = plt.subplots(figsize=(12,3))
         plt.tight_layout()
-        self.canvas_raw = FigureCanvasTkAgg(self.fig_raw, master=self)
-        self.canvas_raw.get_tk_widget().grid(row=0, column=0, columnspan=2, sticky='nsew')
+        
+        # Создаем фрейм для графика и панели инструментов
+        graph_frame = ttk.Frame(self)
+        graph_frame.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        graph_frame.rowconfigure(0, weight=1)
+        graph_frame.columnconfigure(0, weight=1)
+        
+        # Включаем встроенные инструменты навигации matplotlib
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        self.canvas_raw = FigureCanvasTkAgg(self.fig_raw, master=graph_frame)
+        self.canvas_raw.get_tk_widget().grid(row=0, column=0, sticky='nsew')
+        
+        # Добавляем панель инструментов matplotlib в отдельный фрейм
+        toolbar_frame = ttk.Frame(self)
+        toolbar_frame.grid(row=1, column=0, columnspan=2, sticky='ew')
+        toolbar_frame.columnconfigure(0, weight=1)
+        
+        self.toolbar_raw = NavigationToolbar2Tk(self.canvas_raw, toolbar_frame)
+        self.toolbar_raw.grid(row=0, column=0, sticky='ew')
+        
+        # Метки поверх графика
         self.hr_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="ЧСС: -- bpm", background='#fff')
         self.hr_label.place(relx=0.01, rely=0.01)
         
@@ -380,15 +430,17 @@ class ECGApp(tk.Tk):
         self.span = SpanSelector(self.ax_raw, self.onselect_region, 'horizontal', useblit=True,
                                  props=dict(alpha=0.3, facecolor='red'), button=1, minspan=0.01)
         self.span.set_active(False)
-        self.fig_raw.canvas.mpl_connect('button_press_event', self.on_click)
-        self.fig_raw.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.fig_raw.canvas.mpl_connect('button_release_event', self.on_release)
+        
+        # Подключаем события мыши к canvas
+        self.canvas_raw.mpl_connect('button_press_event', self.on_click)
+        self.canvas_raw.mpl_connect('motion_notify_event', self.on_motion)
+        self.canvas_raw.mpl_connect('button_release_event', self.on_release)
 
         # --- Усреднённый комплекс ---
         self.fig_avg, self.ax_avg = plt.subplots(figsize=(4,2))
         plt.tight_layout()
         self.canvas_avg = FigureCanvasTkAgg(self.fig_avg, master=self)
-        self.canvas_avg.get_tk_widget().grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
+        self.canvas_avg.get_tk_widget().grid(row=2, column=0, sticky='nsew', padx=5, pady=5)
         
         # Подключаем обработчик кликов для усредненного комплекса
         self.fig_avg.canvas.mpl_connect('button_press_event', self.on_avg_click)
@@ -397,7 +449,7 @@ class ECGApp(tk.Tk):
         self.fig_sp, self.ax_sp = plt.subplots(figsize=(4,2))
         plt.tight_layout()
         self.canvas_sp = FigureCanvasTkAgg(self.fig_sp, master=self)
-        self.canvas_sp.get_tk_widget().grid(row=1, column=1, sticky='nsew', padx=5, pady=5)
+        self.canvas_sp.get_tk_widget().grid(row=2, column=1, sticky='nsew', padx=5, pady=5)
 
 
 
@@ -405,11 +457,11 @@ class ECGApp(tk.Tk):
         self.fig_sel, self.ax_sel = plt.subplots(figsize=(8,2))
         plt.tight_layout()
         self.canvas_sel = FigureCanvasTkAgg(self.fig_sel, master=self)
-        self.canvas_sel.get_tk_widget().grid(row=2, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
+        self.canvas_sel.get_tk_widget().grid(row=3, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
         # --- Текстовое поле для параметров ---
         text_frame = ttk.LabelFrame(self, text="Параметры и измерения")
-        text_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        text_frame.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         
         # Создаем текстовое поле с прокруткой
         text_container = ttk.Frame(text_frame)
@@ -434,7 +486,7 @@ class ECGApp(tk.Tk):
         
         # --- Панель кнопок ---
         ctrl = ttk.Frame(self)
-        ctrl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        ctrl.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(ctrl, text='Notch 50 Hz', command=self.toggle_notch).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector).pack(side='left', padx=5)
         
@@ -469,8 +521,96 @@ class ECGApp(tk.Tk):
         try:
             self.mm, self.total = open_ecg_memmap(fn)
             self.clear_markup()
+            
+            # Загружаем полную запись для отображения в matplotlib
+            self.load_full_recording()
+            
         except Exception as e:
             messagebox.showerror('Ошибка', str(e))
+            
+    def load_full_recording(self):
+        """Загружает полную запись для отображения в matplotlib"""
+        if self.mm is None:
+            return
+            
+        try:
+            # Показываем прогресс
+            self.progress_label.config(text="Загрузка записи...")
+            self.update()
+            
+            # Извлекаем полную запись
+            full_ecg = extract_channel(self.mm, self.total, 0, 0, self.total).astype(np.float64)
+            full_ecg = full_ecg * ((2*2.4)/(2**24)) * 1e3
+            
+            # Применяем фильтры
+            full_ecg = highpass_filter(full_ecg, FS, cutoff=0.5)
+            if self.notch_enabled:
+                full_ecg = notch_filter(full_ecg, FS)
+            
+            # Создаем временную шкалу
+            t_full = np.arange(len(full_ecg)) / FS
+            
+            # Сохраняем данные для использования
+            self.full_ecg = full_ecg
+            self.t_full = t_full
+            
+            # Отрисовываем полную запись с пиками
+            self.draw_raw()
+            
+            # Устанавливаем начальные границы просмотра
+            self.ax_raw.set_xlim(0, min(100, len(full_ecg) / FS))  # Первые 100 секунд
+            self.canvas_raw.draw()
+            
+            # Автоматически детектируем пики для отображения
+            self.detect_peaks_for_display()
+            
+            # Очищаем прогресс
+            self.progress_label.config(text="")
+            
+        except Exception as e:
+            self.progress_label.config(text=f"Ошибка загрузки: {e}")
+            print(f"Ошибка загрузки записи: {e}")
+            
+    def detect_peaks_for_display(self):
+        """Детектирует пики для отображения на полной записи"""
+        if not hasattr(self, 'full_ecg') or self.full_ecg is None:
+            return
+            
+        try:
+            self.progress_label.config(text="Детекция пиков...")
+            self.update()
+            
+            # Детектируем пики на полной записи
+            peaks, _, _, _, _ = detect_r_peaks(
+                self.full_ecg, FS,
+                sensitivity=self.sensitivity.get(),
+                min_rr_ms=self.min_rr_ms.get(),
+                window_ms=self.window_ms.get(),
+                search_window_ms=self.search_window_ms.get(),
+                notch_enabled=False  # Фильтры уже применены
+            )
+            
+            # Сохраняем пики
+            self.r_peaks = peaks
+            
+            # Обновляем отображение
+            self.draw_raw()
+            self.canvas_raw.draw()
+            
+            # Обновляем метки
+            self.peaks_label.config(text=f"Пики: {len(self.r_peaks)}")
+            
+            # Вычисляем ЧСС
+            if len(self.r_peaks) > 1:
+                rr_intervals = np.diff(self.r_peaks) / FS * 1000  # в мс
+                hr = 60000 / np.mean(rr_intervals)  # ударов в минуту
+                self.hr_label.config(text=f"ЧСС: {hr:.1f} bpm")
+            
+            self.progress_label.config(text="")
+            
+        except Exception as e:
+            self.progress_label.config(text=f"Ошибка детекции: {e}")
+            print(f"Ошибка детекции пиков: {e}")
 
     def toggle_notch(self):
         self.notch_enabled = not self.notch_enabled
@@ -584,7 +724,7 @@ class ECGApp(tk.Tk):
 
     def update_text_parameters(self):
         """Обновить параметры в текстовом поле"""
-        if self.ecg is None or len(self.r_peaks) == 0:
+        if not hasattr(self, 'full_ecg') or self.full_ecg is None or len(self.r_peaks) == 0:
             messagebox.showwarning("Предупреждение", "Нет данных для анализа")
             return
         
@@ -1030,7 +1170,15 @@ RR ИНТЕРВАЛЫ:
     def onselect_region(self, x0, x1):
         start, end = min(x0,x1), max(x0,x1)
         self.bad_regions.append((start, end))
-        patch = Rectangle((start, min(self.ecg)), end-start, max(self.ecg)-min(self.ecg),
+        
+        # Получаем границы по Y для полной записи
+        if hasattr(self, 'full_ecg') and self.full_ecg is not None:
+            y_min = np.min(self.full_ecg)
+            y_max = np.max(self.full_ecg)
+        else:
+            y_min, y_max = -1, 1
+        
+        patch = Rectangle((start, y_min), end-start, y_max-y_min,
                           color='red', alpha=0.3)
         self.ax_raw.add_patch(patch)
         self.region_patches.append(patch)
@@ -1061,19 +1209,22 @@ RR ИНТЕРВАЛЫ:
         
         # Ручное добавление/удаление пиков
         if self.manual_peak_mode:
-            t = ev.xdata
-            # Конвертируем время отображения в полную частоту дискретизации
-            display_start = int(START_DELAY * FS)
-            sample_idx = display_start + int(t * FS_DISPLAY) * int(FS / FS_DISPLAY)
+            t = ev.xdata  # Это уже абсолютное время
+            # Конвертируем абсолютное время в индекс сэмпла
+            sample_idx = int(t * FS)
+            
+            # Проверяем границы
+            if sample_idx < 0 or sample_idx >= len(self.full_ecg):
+                return
             
             if ev.button == 3:  # Правый клик - добавить пик
                 # Ищем локальный максимум в окрестности клика
                 search_window = int(0.1 * FS)  # 100 мс окно поиска
                 start = max(0, sample_idx - search_window)
-                end = min(len(self.ecg), sample_idx + search_window)
+                end = min(len(self.full_ecg), sample_idx + search_window)
                 
                 # Находим локальный максимум
-                local_max_idx = start + np.argmax(self.ecg[start:end])
+                local_max_idx = start + np.argmax(self.full_ecg[start:end])
                 
                 # Добавляем пик в список
                 self.r_peaks = np.append(self.r_peaks, local_max_idx)
@@ -1082,6 +1233,7 @@ RR ИНТЕРВАЛЫ:
                 new_idx = np.where(self.r_peaks == local_max_idx)[0][0]
                 self.manual_peaks.add(new_idx)  # запоминаем как ручной
                 
+                self._invalidate_cache()
                 self.draw_raw()
                 
             elif ev.button == 1:  # Левый клик - удалить пик
@@ -1106,15 +1258,14 @@ RR ИНТЕРВАЛЫ:
                             elif self.selected_idx > nearest_idx:
                                 self.selected_idx -= 1
                         
+                        self._invalidate_cache()
                         self.draw_raw()
         
         # Выбор комплекса для отображения
         elif self.select_complex_mode and ev.button == 1:
             if len(self.r_peaks) > 0:
-                # Конвертируем время клика в полную частоту дискретизации
-                display_start = int(START_DELAY * FS)
-                click_sample = display_start + int(ev.xdata * FS_DISPLAY) * int(FS / FS_DISPLAY)
-                click_time_full = click_sample / FS
+                # ev.xdata уже содержит абсолютное время
+                click_time_full = ev.xdata
                 
                 # Ищем ближайший пик
                 distances = np.abs(self.r_peaks/FS - click_time_full)
@@ -1124,6 +1275,24 @@ RR ИНТЕРВАЛЫ:
                     self.selected_idx = nearest_idx
                     self.draw_selected()
                     self.draw_raw()  # Обновляем отображение для показа выбранного пика
+                    
+        # Режим измерений на усредненном комплексе
+        elif self.measurement_mode:
+            if ev.button == 1:  # Левый клик - добавить маркер
+                # Здесь должна быть логика для добавления маркеров на усредненном комплексе
+                pass
+            elif ev.button == 3:  # Правый клик - удалить маркер
+                # Здесь должна быть логика для удаления маркеров
+                pass
+                
+        # Режим редактирования маркеров
+        elif self.marker_edit_mode:
+            if ev.button == 1:  # Левый клик - добавить/переместить маркер
+                # Здесь должна быть логика для редактирования маркеров
+                pass
+            elif ev.button == 3:  # Правый клик - удалить маркер
+                # Здесь должна быть логика для удаления маркеров
+                pass
 
     def on_motion(self, ev):
         if not self.resizing or ev.inaxes!=self.ax_raw:
@@ -1178,20 +1347,7 @@ RR ИНТЕРВАЛЫ:
         else:
             self.hr_label.config(text="ЧСС: -- bpm")
 
-        # Для отображения берем только часть данных (первые 100 секунд)
-        display_start = int(START_DELAY * FS)
-        display_count = min(READ_COUNT, self.total - display_start)
-        raw = extract_channel(self.mm, self.total, 0, display_start, display_count).astype(np.float64)
-        ecg_full = raw * ((2*2.4)/(2**24)) * 1e3
-        
-        # Применяем фильтры для отображения на полной частоте
-        ecg_full = highpass_filter(ecg_full, FS, cutoff=0.5)
-        if self.notch_enabled:
-            ecg_full = notch_filter(ecg_full, FS)
-        
-        # Понижаем частоту дискретизации для отображения
-        self.ecg = downsample_for_display(ecg_full, FS, FS_DISPLAY)
-
+        # Обновляем отображение пиков на графике
         self.draw_raw()
         
         # Создаем усредненный комплекс из всех пиков
@@ -1220,72 +1376,220 @@ RR ИНТЕРВАЛЫ:
         
         # Очищаем прогресс
         self.progress_label.config(text="")
+        
+        # Инвалидируем кэш
+        self._cache_valid = False
     
     def update_progress(self, progress):
         """Обновление индикатора прогресса"""
         self.progress_label.config(text=f"Прогресс: {progress:.1f}%")
         self.update()
+    
+    def _invalidate_cache(self):
+        """Инвалидация кэша при изменении данных"""
+        self._cache_valid = False
+        
+    def get_cache_key(self, position, duration):
+        """Генерирует ключ кэша для фрагмента"""
+        # Округляем позицию до 1 секунды для группировки близких фрагментов
+        rounded_pos = int(position)
+        return f"{rounded_pos}_{duration}"
+        
+    def get_cached_fragment(self, position, duration):
+        """Получает фрагмент из кэша"""
+        with self.cache_lock:
+            key = self.get_cache_key(position, duration)
+            return self.cache.get(key)
+            
+    def cache_fragment(self, position, duration, data):
+        """Сохраняет фрагмент в кэш"""
+        with self.cache_lock:
+            key = self.get_cache_key(position, duration)
+            # Ограничиваем размер кэша
+            if len(self.cache) > 10:
+                # Удаляем самый старый элемент
+                oldest_key = next(iter(self.cache))
+                del self.cache[oldest_key]
+            self.cache[key] = data
+            
+    def process_fragment_async(self, position, duration):
+        """Асинхронная обработка фрагмента в отдельном потоке"""
+        if self.is_processing:
+            return
+            
+        self.is_processing = True
+        
+        def process():
+            try:
+                if self.mm is None:
+                    return
+                    
+                # Проверяем кэш
+                cached = self.get_cached_fragment(position, duration)
+                if cached is not None:
+                    self.display_queue.put(('cached', cached))
+                    return
+                
+                # Обрабатываем фрагмент
+                start_sample = int(position * FS)
+                end_sample = min(start_sample + int(duration * FS), self.total)
+                
+                if end_sample <= start_sample:
+                    return
+                    
+                # Извлекаем данные
+                fragment = extract_channel(self.mm, self.total, 0, start_sample, end_sample - start_sample)
+                fragment = fragment.astype(np.float64) * ((2*2.4)/(2**24)) * 1e3
+                
+                # Применяем фильтры
+                fragment = highpass_filter(fragment, FS, cutoff=0.5)
+                if self.notch_enabled:
+                    fragment = notch_filter(fragment, FS)
+                
+                # Находим пики в фрагменте
+                peaks, _, _, _, _ = detect_r_peaks(
+                    fragment, FS,
+                    sensitivity=self.sensitivity.get(),
+                    min_rr_ms=self.min_rr_ms.get(),
+                    window_ms=self.window_ms.get(),
+                    search_window_ms=self.search_window_ms.get(),
+                    notch_enabled=False  # Уже применен
+                )
+                
+                # Корректируем позиции пиков
+                peaks += start_sample
+                
+                # Фильтруем пики в пределах фрагмента
+                peaks = peaks[(peaks >= start_sample) & (peaks < end_sample)]
+                
+                # Конвертируем в относительные позиции для отображения
+                display_peaks = [(p - start_sample, fragment[p - start_sample]) for p in peaks]
+                
+                result = {
+                    'fragment': fragment,
+                    'peaks': display_peaks,
+                    'start_sample': start_sample,
+                    'position': position
+                }
+                
+                # Кэшируем результат
+                self.cache_fragment(position, duration, result)
+                
+                # Отправляем в очередь отображения
+                self.display_queue.put(('processed', result))
+                
+            except Exception as e:
+                print(f"Ошибка обработки фрагмента: {e}")
+            finally:
+                self.is_processing = False
+        
+        # Запускаем в отдельном потоке
+        self.executor.submit(process)
+    
+    def get_current_view_range(self):
+        """Получает текущий диапазон просмотра из matplotlib"""
+        xlim = self.ax_raw.get_xlim()
+        return xlim[0], xlim[1]
+        
+    def get_current_position(self):
+        """Получает текущую позицию просмотра"""
+        xlim = self.ax_raw.get_xlim()
+        return (xlim[0] + xlim[1]) / 2
+    
+
+    
+    def update_display(self):
+        """Обновление отображения - теперь использует matplotlib навигацию"""
+        # Этот метод больше не нужен, так как навигация через matplotlib
+        pass
 
     def draw_raw(self):
+        """Отрисовка полной записи с пиками"""
+        if not hasattr(self, 'full_ecg') or self.full_ecg is None:
+            return
+            
+        # Очищаем график
         self.ax_raw.cla()
-        t = np.arange(len(self.ecg)) / FS_DISPLAY  # Используем пониженную частоту для времени
-        self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
         
-        # Отображаем автоматически найденные пики красным (только те, что попадают в отображаемый диапазон)
-        display_start = int(START_DELAY * FS)
-        display_end = display_start + len(self.ecg) * int(FS / FS_DISPLAY)  # Учитываем понижение частоты
+        # Отрисовываем полную запись
+        self.ax_raw.plot(self.t_full, self.full_ecg, color='black', linewidth=0.5, alpha=0.8)
         
-        auto_peaks = [i for i, peak in enumerate(self.r_peaks) if i not in self.manual_peaks]
-        if auto_peaks:
-            auto_peak_positions = self.r_peaks[auto_peaks]
-            # Фильтруем пики, которые попадают в отображаемый диапазон
-            visible_peaks = auto_peak_positions[(auto_peak_positions >= display_start) & (auto_peak_positions < display_end)]
-            if len(visible_peaks) > 0:
-                # Корректируем позиции относительно начала отображения и понижаем частоту
-                visible_peaks_adjusted = (visible_peaks - display_start) / int(FS / FS_DISPLAY)
-                # Находим соответствующие значения сигнала
-                peak_indices = visible_peaks_adjusted.astype(int)
-                peak_indices = peak_indices[(peak_indices >= 0) & (peak_indices < len(self.ecg))]
-                if len(peak_indices) > 0:
-                    self.ax_raw.plot(peak_indices / FS_DISPLAY, self.ecg[peak_indices], 'ro', markersize=3, label='Автоматические пики')
+        # Отрисовываем пики
+        if hasattr(self, 'r_peaks') and len(self.r_peaks) > 0:
+            # Проверяем, что индексы пиков не выходят за границы
+            valid_peaks = self.r_peaks[(self.r_peaks >= 0) & (self.r_peaks < len(self.full_ecg))]
+            
+            if len(valid_peaks) > 0:
+                peak_times = valid_peaks / FS
+                peak_values = self.full_ecg[valid_peaks]
+                
+                # Разделяем автоматические и ручные пики
+                auto_peaks = []
+                manual_peaks = []
+                selected_peak = None
+                
+                for i, (t, val) in enumerate(zip(peak_times, peak_values)):
+                    # Находим соответствующий индекс в оригинальном массиве пиков
+                    orig_idx = np.where(self.r_peaks == valid_peaks[i])[0][0]
+                    
+                    if orig_idx in self.manual_peaks:
+                        manual_peaks.append((t, val))
+                    elif orig_idx == self.selected_idx:
+                        selected_peak = (t, val)
+                    else:
+                        auto_peaks.append((t, val))
+                
+                # Отрисовываем пики
+                if auto_peaks:
+                    x, y = zip(*auto_peaks)
+                    self.ax_raw.plot(x, y, 'ro', markersize=3, label='Автоматические пики')
+                
+                if manual_peaks:
+                    x, y = zip(*manual_peaks)
+                    self.ax_raw.plot(x, y, 'go', markersize=4, label='Ручные пики')
+                
+                if selected_peak:
+                    x, y = selected_peak
+                    self.ax_raw.plot(x, y, 'bo', markersize=6, label='Выбранный пик')
+                
+                self.ax_raw.legend(loc='upper right', fontsize=8)
         
-        # Отображаем ручные пики зеленым
-        if self.manual_peaks:
-            manual_peak_positions = self.r_peaks[list(self.manual_peaks)]
-            visible_manual_peaks = manual_peak_positions[(manual_peak_positions >= display_start) & (manual_peak_positions < display_end)]
-            if len(visible_manual_peaks) > 0:
-                visible_manual_peaks_adjusted = (visible_manual_peaks - display_start) / int(FS / FS_DISPLAY)
-                peak_indices = visible_manual_peaks_adjusted.astype(int)
-                peak_indices = peak_indices[(peak_indices >= 0) & (peak_indices < len(self.ecg))]
-                if len(peak_indices) > 0:
-                    self.ax_raw.plot(peak_indices / FS_DISPLAY, self.ecg[peak_indices], 'go', markersize=4, label='Ручные пики')
-        
-        # Отображаем выбранный пик синим
-        if self.selected_idx is not None and self.selected_idx < len(self.r_peaks):
-            selected_peak = self.r_peaks[self.selected_idx]
-            if display_start <= selected_peak < display_end:
-                selected_peak_adjusted = (selected_peak - display_start) / int(FS / FS_DISPLAY)
-                peak_index = int(selected_peak_adjusted)
-                if 0 <= peak_index < len(self.ecg):
-                    self.ax_raw.plot(peak_index / FS_DISPLAY, self.ecg[peak_index], 'bo', markersize=6, label='Выбранный пик')
-        
+        # Отрисовываем выделенные регионы
         for patch in self.region_patches:
             self.ax_raw.add_patch(patch)
         
-        if len(self.r_peaks) > 0:
-            self.ax_raw.legend(loc='upper right', fontsize=8)
+        # Настройки графика
+        self.ax_raw.set_xlabel('Время (сек)')
+        self.ax_raw.set_ylabel('Амплитуда (мВ)')
+        self.ax_raw.set_title('Полная запись ЭКГ')
+        self.ax_raw.grid(True, alpha=0.3)
         
+        # Обновляем canvas
         self.canvas_raw.draw()
 
     def draw_selected(self):
         self.ax_sel.cla()
-        if self.selected_idx is not None:
+        if self.selected_idx is not None and self.selected_idx < len(self.r_peaks):
             r = self.r_peaks[self.selected_idx]
             half = int(0.3 * FS)
-            seg = self.ecg[max(r-half,0):r+half]
+            start = max(r-half, 0)
+            end = min(r+half, self.total)
+            
+            # Извлекаем данные с полной частотой дискретизации
+            raw = extract_channel(self.mm, self.total, 0, start, end - start).astype(np.float64)
+            seg = raw * ((2*2.4)/(2**24)) * 1e3
+            
+            # Применяем фильтры
+            seg = highpass_filter(seg, FS, cutoff=0.5)
+            if self.notch_enabled:
+                seg = notch_filter(seg, FS)
+            
             tseg = np.linspace(-half/FS, half/FS, len(seg))
             self.ax_sel.plot(tseg, seg, color='green')
         self.ax_sel.set_title('Выбранный комплекс')
+        self.ax_sel.set_xlabel('Время (с)')
+        self.ax_sel.set_ylabel('Амплитуда (мВ)')
+        self.ax_sel.grid(True, alpha=0.3)
         self.canvas_sel.draw()
 
     def copy_screenshot(self):

@@ -1,4 +1,3 @@
-# 3 коммит
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -43,11 +42,83 @@ def notch_filter(data, fs, freq=50.0, Q=30.0):
     b, a = iirnotch(freq, Q, fs)
     return filtfilt(b, a, data)
 
-def detect_r_peaks(ecg, fs):
-    height = np.mean(ecg) + 0.15 * (ecg.max() - np.mean(ecg))
-    min_dist = int(0.2 * fs)
-    peaks, _ = find_peaks(ecg, distance=min_dist, height=height)
-    return peaks
+def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, search_window_ms=50):
+    """
+    Алгоритм Томсона (Pan-Tompkins) для детекции R-пиков в ЭКГ
+    
+    Параметры:
+    - sensitivity: чувствительность (0.1-2.0, по умолчанию 1.0)
+    - min_rr_ms: минимальное расстояние между пиками в мс (по умолчанию 200)
+    - window_ms: размер окна интегрирования в мс (по умолчанию 120)
+    - search_window_ms: окно поиска точного пика в мс (по умолчанию 50)
+    """
+    # 1. Полосовой фильтр (5-15 Гц для QRS)
+    from scipy.signal import butter, filtfilt
+    
+    # Нормализация частоты дискретизации
+    nyquist = fs / 2
+    low = 5 / nyquist
+    high = 15 / nyquist
+    b, a = butter(2, [low, high], btype='band')
+    filtered = filtfilt(b, a, ecg)
+    
+    # 2. Дифференцирование
+    diff_signal = np.diff(filtered)
+    
+    # 3. Возведение в квадрат
+    squared = diff_signal ** 2
+    
+    # 4. Интегрирование с окном
+    window_size = int(window_ms * fs / 1000)
+    integrated = np.convolve(squared, np.ones(window_size), mode='same')
+    
+    # 5. Адаптивный порог с учетом чувствительности
+    # Начальный порог
+    threshold_i1 = (0.6 / sensitivity) * np.max(integrated)
+    threshold_i2 = 0.6 * threshold_i1
+    
+    # Списки для хранения пиков
+    r_peaks = []
+    noise_peaks = []
+    signal_peaks = []
+    
+    # Минимальное расстояние между пиками
+    min_rr = int(min_rr_ms * fs / 1000)
+    
+    # Поиск пиков
+    for i in range(1, len(integrated) - 1):
+        if integrated[i] > integrated[i-1] and integrated[i] > integrated[i+1]:
+            if integrated[i] > threshold_i1:
+                # Проверяем минимальное расстояние
+                if not r_peaks or (i - r_peaks[-1]) > min_rr:
+                    r_peaks.append(i)
+                    signal_peaks.append(i)
+            elif integrated[i] > threshold_i2:
+                noise_peaks.append(i)
+    
+    # 6. Адаптивное обновление порогов
+    if len(signal_peaks) > 8:
+        # Обновляем пороги каждые 8 пиков
+        signal_level = np.mean([integrated[peak] for peak in signal_peaks[-8:]])
+        noise_level = np.mean([integrated[peak] for peak in noise_peaks[-8:]]) if noise_peaks else signal_level * 0.5
+        
+        threshold_i1 = (noise_level + 0.25 * (signal_level - noise_level)) / sensitivity
+        threshold_i2 = 0.5 * threshold_i1
+    
+    # 7. Поиск точных позиций R-пиков в оригинальном сигнале
+    final_peaks = []
+    search_window = int(search_window_ms * fs / 1000)
+    
+    for peak in r_peaks:
+        start = max(0, peak - search_window)
+        end = min(len(ecg), peak + search_window)
+        
+        # Ищем максимум в окне
+        local_max_idx = start + np.argmax(ecg[start:end])
+        final_peaks.append(local_max_idx)
+    
+    # Возвращаем также промежуточные сигналы для визуализации
+    return np.array(final_peaks), filtered, diff_signal, squared, integrated
 
 def average_complex(ecg, peaks, fs, window_ms=700):
     half = int(window_ms * fs / 1000 / 2)
@@ -71,6 +142,43 @@ def copy_image_to_clipboard(img):
     win32clipboard.SetClipboardData(win32con.CF_DIB, data)
     win32clipboard.CloseClipboard()
 
+def plot_tompson_stages(ax, ecg, peaks, filtered, diff_signal, squared, integrated, fs):
+    """
+    Отображение этапов алгоритма Томсона
+    """
+    ax.clear()
+    
+    # Показываем только первые 5 секунд для наглядности
+    t_max = 5.0
+    n_samples = int(t_max * fs)
+    t = np.arange(min(n_samples, len(ecg))) / fs
+    
+    # Нормализация сигналов для отображения
+    ecg_norm = ecg[:len(t)] / np.max(np.abs(ecg[:len(t)]))
+    filtered_norm = filtered[:len(t)] / np.max(np.abs(filtered[:len(t)])) if len(filtered) >= len(t) else filtered / np.max(np.abs(filtered))
+    diff_norm = diff_signal[:len(t)-1] / np.max(np.abs(diff_signal[:len(t)-1])) if len(diff_signal) >= len(t)-1 else diff_signal / np.max(np.abs(diff_signal))
+    squared_norm = squared[:len(t)-1] / np.max(squared[:len(t)-1]) if len(squared) >= len(t)-1 else squared / np.max(squared)
+    integrated_norm = integrated[:len(t)] / np.max(integrated[:len(t)]) if len(integrated) >= len(t) else integrated / np.max(integrated)
+    
+    # Смещение для отображения
+    offset = 2.5
+    ax.plot(t, ecg_norm + offset*4, 'b-', linewidth=0.8, label='Исходный ЭКГ')
+    ax.plot(t, filtered_norm + offset*3, 'g-', linewidth=0.8, label='Полосовой фильтр')
+    ax.plot(t[:-1], diff_norm + offset*2, 'r-', linewidth=0.8, label='Дифференцирование')
+    ax.plot(t[:-1], squared_norm + offset*1, 'm-', linewidth=0.8, label='Квадрат')
+    ax.plot(t, integrated_norm, 'k-', linewidth=0.8, label='Интегрирование')
+    
+    # Отмечаем найденные пики
+    peaks_in_window = peaks[peaks < n_samples]
+    if len(peaks_in_window) > 0:
+        ax.plot(peaks_in_window/fs, integrated_norm[peaks_in_window], 'ro', markersize=4, label='R-пики')
+    
+    ax.set_title('Этапы алгоритма Томсона')
+    ax.set_ylabel('Амплитуда (норм.)')
+    ax.set_xlabel('Время (с)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
 def on_close(app):
     plt.close('all')
     app.destroy()
@@ -89,6 +197,9 @@ class ECGApp(tk.Tk):
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="Открыть запись...", command=self.open_file)
         filemenu.add_separator()
+        filemenu.add_command(label="Сохранить параметры...", command=self.save_params)
+        filemenu.add_command(label="Загрузить параметры...", command=self.load_params)
+        filemenu.add_separator()
         filemenu.add_command(label="Выход", command=lambda: on_close(self))
         menubar.add_cascade(label="Файл", menu=filemenu)
         self.config(menu=menubar)
@@ -106,17 +217,19 @@ class ECGApp(tk.Tk):
         self.select_complex_mode = False
         self.selected_idx = None
         
-        # --- Параметры масштабирования времени ---
-        self.time_scale = 1.0        # коэффициент масштабирования времени
-        self.time_center = 0.0       # центр временного окна
-        self.time_window = 50.0      # размер временного окна в секундах
+        # --- Параметры алгоритма Томсона ---
+        self.sensitivity = tk.DoubleVar(value=1.0)
+        self.min_rr_ms = tk.IntVar(value=200)
+        self.window_ms = tk.IntVar(value=120)
+        self.search_window_ms = tk.IntVar(value=50)
 
         # --- Разметка grid ---
         self.rowconfigure(0, weight=3)
-        self.rowconfigure(1, weight=0)  # панель управления масштабом
+        self.rowconfigure(1, weight=2)
         self.rowconfigure(2, weight=2)
         self.rowconfigure(3, weight=2)
-        self.rowconfigure(4, weight=0)
+        self.rowconfigure(4, weight=1)
+        self.rowconfigure(5, weight=0)
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
 
@@ -127,24 +240,9 @@ class ECGApp(tk.Tk):
         self.canvas_raw.get_tk_widget().grid(row=0, column=0, columnspan=2, sticky='nsew')
         self.hr_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="ЧСС: -- bpm", background='#fff')
         self.hr_label.place(relx=0.01, rely=0.01)
-
-        # --- Панель управления масштабом времени ---
-        scale_frame = ttk.Frame(self)
-        scale_frame.grid(row=1, column=0, columnspan=2, sticky='ew', padx=5, pady=2)
         
-        ttk.Label(scale_frame, text="Масштаб времени:").pack(side='left', padx=(0,5))
-        
-        self.scale_var = tk.DoubleVar(value=1.0)
-        self.time_scale_slider = ttk.Scale(scale_frame, from_=0.1, to=10.0, 
-                                          variable=self.scale_var, orient='horizontal',
-                                          command=self.on_time_scale_change)
-        self.time_scale_slider.pack(side='left', fill='x', expand=True, padx=5)
-        
-        self.scale_label = ttk.Label(scale_frame, text="1.0x")
-        self.scale_label.pack(side='left', padx=5)
-        
-        ttk.Button(scale_frame, text="Сброс", command=self.reset_time_scale).pack(side='left', padx=5)
-        ttk.Button(scale_frame, text="Весь сигнал", command=self.show_full_signal).pack(side='left', padx=5)
+        self.peaks_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="Пики: 0", background='#fff')
+        self.peaks_label.place(relx=0.01, rely=0.05)
 
         # SpanSelector и события мыши
         self.span = SpanSelector(self.ax_raw, self.onselect_region, 'horizontal', useblit=True,
@@ -158,13 +256,19 @@ class ECGApp(tk.Tk):
         self.fig_avg, self.ax_avg = plt.subplots(figsize=(4,2))
         plt.tight_layout()
         self.canvas_avg = FigureCanvasTkAgg(self.fig_avg, master=self)
-        self.canvas_avg.get_tk_widget().grid(row=2, column=0, sticky='nsew', padx=5, pady=5)
+        self.canvas_avg.get_tk_widget().grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
 
         # --- Спектр ---
         self.fig_sp, self.ax_sp = plt.subplots(figsize=(4,2))
         plt.tight_layout()
         self.canvas_sp = FigureCanvasTkAgg(self.fig_sp, master=self)
-        self.canvas_sp.get_tk_widget().grid(row=2, column=1, sticky='nsew', padx=5, pady=5)
+        self.canvas_sp.get_tk_widget().grid(row=1, column=1, sticky='nsew', padx=5, pady=5)
+
+        # --- Этапы алгоритма Томсона ---
+        self.fig_tom, self.ax_tom = plt.subplots(figsize=(8,2))
+        plt.tight_layout()
+        self.canvas_tom = FigureCanvasTkAgg(self.fig_tom, master=self)
+        self.canvas_tom.get_tk_widget().grid(row=2, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
         # --- Выбранный комплекс ---
         self.fig_sel, self.ax_sel = plt.subplots(figsize=(8,2))
@@ -172,53 +276,56 @@ class ECGApp(tk.Tk):
         self.canvas_sel = FigureCanvasTkAgg(self.fig_sel, master=self)
         self.canvas_sel.get_tk_widget().grid(row=3, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
+        # --- Панель управления алгоритмом Томсона ---
+        tompson_frame = ttk.LabelFrame(self, text="Параметры алгоритма Томсона")
+        tompson_frame.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        
+        # Первая строка параметров
+        param_row1 = ttk.Frame(tompson_frame)
+        param_row1.pack(fill='x', padx=5, pady=2)
+        
+        ttk.Label(param_row1, text="Чувствительность:").pack(side='left', padx=5)
+        sensitivity_scale = ttk.Scale(param_row1, from_=0.1, to=2.0, variable=self.sensitivity, 
+                                     orient='horizontal', length=150, command=self.on_param_change)
+        sensitivity_scale.pack(side='left', padx=5)
+        self.sensitivity_label = ttk.Label(param_row1, text="1.0")
+        self.sensitivity_label.pack(side='left', padx=5)
+        
+        ttk.Label(param_row1, text="Мин. RR (мс):").pack(side='left', padx=5)
+        min_rr_scale = ttk.Scale(param_row1, from_=100, to=500, variable=self.min_rr_ms, 
+                                orient='horizontal', length=150, command=self.on_param_change)
+        min_rr_scale.pack(side='left', padx=5)
+        self.min_rr_label = ttk.Label(param_row1, text="200")
+        self.min_rr_label.pack(side='left', padx=5)
+        
+        # Вторая строка параметров
+        param_row2 = ttk.Frame(tompson_frame)
+        param_row2.pack(fill='x', padx=5, pady=2)
+        
+        ttk.Label(param_row2, text="Окно интегрирования (мс):").pack(side='left', padx=5)
+        window_scale = ttk.Scale(param_row2, from_=50, to=200, variable=self.window_ms, 
+                                orient='horizontal', length=150, command=self.on_param_change)
+        window_scale.pack(side='left', padx=5)
+        self.window_label = ttk.Label(param_row2, text="120")
+        self.window_label.pack(side='left', padx=5)
+        
+        ttk.Label(param_row2, text="Окно поиска (мс):").pack(side='left', padx=5)
+        search_scale = ttk.Scale(param_row2, from_=20, to=100, variable=self.search_window_ms, 
+                                orient='horizontal', length=150, command=self.on_param_change)
+        search_scale.pack(side='left', padx=5)
+        self.search_label = ttk.Label(param_row2, text="50")
+        self.search_label.pack(side='left', padx=5)
+        
         # --- Панель кнопок ---
         ctrl = ttk.Frame(self)
-        ctrl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        ctrl.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(ctrl, text='Notch 50 Hz', command=self.toggle_notch).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Отметить комплекс', command=self.toggle_peak_selector).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Выбрать комплекс', command=self.toggle_select_complex).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Обновить', command=self.compute).pack(side='left', padx=5)
+        ttk.Button(ctrl, text='Сброс параметров', command=self.reset_tompson_params).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Copy Screenshot', command=self.copy_screenshot).pack(side='left', padx=5)
-
-    # --- Методы управления масштабом времени ---
-    def on_time_scale_change(self, value):
-        self.time_scale = float(value)
-        self.scale_label.config(text=f"{self.time_scale:.1f}x")
-        self.update_time_window()
-        self.draw_raw()
-
-    def reset_time_scale(self):
-        self.time_scale = 1.0
-        self.time_center = 0.0
-        self.scale_var.set(1.0)
-        self.scale_label.config(text="1.0x")
-        self.update_time_window()
-        self.draw_raw()
-
-    def show_full_signal(self):
-        if self.ecg is not None:
-            self.time_scale = 1.0
-            self.time_center = len(self.ecg) / FS / 2
-            self.scale_var.set(1.0)
-            self.scale_label.config(text="1.0x")
-            self.update_time_window()
-            self.draw_raw()
-
-    def update_time_window(self):
-        """Обновляет размер временного окна на основе масштаба"""
-        if self.ecg is not None:
-            total_time = len(self.ecg) / FS
-            self.time_window = total_time / self.time_scale
-            # Ограничиваем окно размером сигнала
-            self.time_window = min(self.time_window, total_time)
-            # Центрируем окно, если оно выходит за границы
-            half_window = self.time_window / 2
-            if self.time_center - half_window < 0:
-                self.time_center = half_window
-            elif self.time_center + half_window > total_time:
-                self.time_center = total_time - half_window
 
     # --- Методы GUI ---
     def open_file(self):
@@ -228,7 +335,6 @@ class ECGApp(tk.Tk):
         try:
             self.mm, self.total = open_ecg_memmap(fn)
             self.clear_markup()
-            self.reset_time_scale()
         except Exception as e:
             messagebox.showerror('Ошибка', str(e))
 
@@ -245,6 +351,94 @@ class ECGApp(tk.Tk):
 
     def toggle_select_complex(self):
         self.select_complex_mode = not self.select_complex_mode
+
+    def on_param_change(self, event=None):
+        """Обработчик изменения параметров алгоритма Томсона"""
+        # Обновляем метки
+        self.sensitivity_label.config(text=f"{self.sensitivity.get():.1f}")
+        self.min_rr_label.config(text=f"{self.min_rr_ms.get()}")
+        self.window_label.config(text=f"{self.window_ms.get()}")
+        self.search_label.config(text=f"{self.search_window_ms.get()}")
+        
+        # Автоматически пересчитываем при изменении параметров
+        if self.mm is not None:
+            self.compute()
+
+    def reset_tompson_params(self):
+        """Сброс параметров алгоритма Томсона к значениям по умолчанию"""
+        self.sensitivity.set(1.0)
+        self.min_rr_ms.set(200)
+        self.window_ms.set(120)
+        self.search_window_ms.set(50)
+        
+        # Обновляем метки
+        self.sensitivity_label.config(text="1.0")
+        self.min_rr_label.config(text="200")
+        self.window_label.config(text="120")
+        self.search_label.config(text="50")
+        
+        # Пересчитываем
+        if self.mm is not None:
+            self.compute()
+
+    def save_params(self):
+        """Сохранение параметров алгоритма Томсона в файл"""
+        import json
+        
+        params = {
+            'sensitivity': self.sensitivity.get(),
+            'min_rr_ms': self.min_rr_ms.get(),
+            'window_ms': self.window_ms.get(),
+            'search_window_ms': self.search_window_ms.get()
+        }
+        
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Сохранить параметры алгоритма Томсона"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(params, f, indent=2, ensure_ascii=False)
+                messagebox.showinfo("Успех", "Параметры сохранены успешно!")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить параметры: {str(e)}")
+
+    def load_params(self):
+        """Загрузка параметров алгоритма Томсона из файла"""
+        import json
+        
+        filename = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Загрузить параметры алгоритма Томсона"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    params = json.load(f)
+                
+                # Устанавливаем параметры
+                self.sensitivity.set(params.get('sensitivity', 1.0))
+                self.min_rr_ms.set(params.get('min_rr_ms', 200))
+                self.window_ms.set(params.get('window_ms', 120))
+                self.search_window_ms.set(params.get('search_window_ms', 50))
+                
+                # Обновляем метки
+                self.sensitivity_label.config(text=f"{self.sensitivity.get():.1f}")
+                self.min_rr_label.config(text=f"{self.min_rr_ms.get()}")
+                self.window_label.config(text=f"{self.window_ms.get()}")
+                self.search_label.config(text=f"{self.search_window_ms.get()}")
+                
+                # Пересчитываем
+                if self.mm is not None:
+                    self.compute()
+                    
+                messagebox.showinfo("Успех", "Параметры загружены успешно!")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось загрузить параметры: {str(e)}")
 
     def clear_markup(self):
         # удалить патчи
@@ -329,10 +523,19 @@ class ECGApp(tk.Tk):
             ecg = notch_filter(ecg, FS)
         self.ecg = ecg
 
-        self.r_peaks = detect_r_peaks(ecg, FS)
+        self.r_peaks, filtered, diff_signal, squared, integrated = detect_r_peaks(
+            ecg, FS, 
+            sensitivity=self.sensitivity.get(),
+            min_rr_ms=self.min_rr_ms.get(),
+            window_ms=self.window_ms.get(),
+            search_window_ms=self.search_window_ms.get()
+        )
         # HR по годным пикам
         good = [r for i,r in enumerate(self.r_peaks)
                 if i not in self.bad_beats and not any(a<=r/FS<=b for a,b in self.bad_regions)]
+        # Обновляем информацию о пиках
+        self.peaks_label.config(text=f"Пики: {len(self.r_peaks)}")
+        
         if len(good)>1:
             rr = np.diff(np.array(good)/FS)
             hr = (60/rr).mean()
@@ -340,7 +543,6 @@ class ECGApp(tk.Tk):
         else:
             self.hr_label.config(text="ЧСС: -- bpm")
 
-        self.update_time_window()
         self.draw_raw()
         
         allb = np.unique(np.concatenate([good, list(self.manual_beats)])).astype(int)
@@ -363,50 +565,21 @@ class ECGApp(tk.Tk):
             mask = xf <= 150
             self.ax_sp.plot(xf[mask], amp[mask], linewidth=1)
         self.ax_sp.set_title('Спектр усреднённого комплекса')
-        self.ax_sp.set_xlabel('Частота (Гц)')
-        self.ax_sp.set_ylabel('Амплитуда')
         self.canvas_sp.draw()
+
+        # Отображение этапов алгоритма Томсона
+        plot_tompson_stages(self.ax_tom, ecg, self.r_peaks, filtered, diff_signal, squared, integrated, FS)
+        self.canvas_tom.draw()
 
         self.draw_selected()
 
     def draw_raw(self):
         self.ax_raw.cla()
-        if self.ecg is None:
-            return
-            
         t = np.arange(len(self.ecg)) / FS
-        
-        # Применяем масштабирование времени
-        if self.time_scale != 1.0:
-            half_window = self.time_window / 2
-            start_time = max(0, self.time_center - half_window)
-            end_time = min(len(self.ecg) / FS, self.time_center + half_window)
-            
-            start_idx = int(start_time * FS)
-            end_idx = int(end_time * FS)
-            
-            t_visible = t[start_idx:end_idx]
-            ecg_visible = self.ecg[start_idx:end_idx]
-            
-            # Фильтруем пики в видимой области
-            visible_peaks = self.r_peaks[(self.r_peaks >= start_idx) & (self.r_peaks < end_idx)]
-            
-            self.ax_raw.plot(t_visible, ecg_visible, color='black', linewidth=0.8)
-            if len(visible_peaks) > 0:
-                self.ax_raw.plot(visible_peaks/FS, self.ecg[visible_peaks], 'ro', markersize=3)
-        else:
-            # Показываем весь сигнал
-            self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
-            self.ax_raw.plot(self.r_peaks/FS, self.ecg[self.r_peaks], 'ro', markersize=3)
-        
-        # Добавляем патчи регионов
+        self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
+        self.ax_raw.plot(self.r_peaks/FS, self.ecg[self.r_peaks], 'ro', markersize=3)
         for patch in self.region_patches:
             self.ax_raw.add_patch(patch)
-            
-        self.ax_raw.set_xlabel('Время (с)')
-        self.ax_raw.set_ylabel('Амплитуда (мВ)')
-        self.ax_raw.set_title(f'ECG сигнал (масштаб: {self.time_scale:.1f}x)')
-        self.ax_raw.grid(True, alpha=0.3)
         self.canvas_raw.draw()
 
     def draw_selected(self):
@@ -418,9 +591,6 @@ class ECGApp(tk.Tk):
             tseg = np.linspace(-half/FS, half/FS, len(seg))
             self.ax_sel.plot(tseg, seg, color='green')
         self.ax_sel.set_title('Выбранный комплекс')
-        self.ax_sel.set_xlabel('Время (с)')
-        self.ax_sel.set_ylabel('Амплитуда (мВ)')
-        self.ax_sel.grid(True, alpha=0.3)
         self.canvas_sel.draw()
 
     def copy_screenshot(self):

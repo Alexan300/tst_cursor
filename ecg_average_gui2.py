@@ -14,13 +14,18 @@ import win32con
 from datetime import datetime
 
 # === Параметры сигнала ===
-FS = 2000.0
+FS = 2000.0  # Полная частота дискретизации для математики
+FS_DISPLAY = 200.0  # Пониженная частота для отрисовки
 BYTES_ECG = 3
 BYTES_AUX = 2 * 4
 N_CHANNELS = 8
 SAMPLE_SIZE = BYTES_ECG * N_CHANNELS + BYTES_AUX
 START_DELAY = 0.5
-READ_COUNT = int(100 * FS)
+READ_COUNT = int(100 * FS)  # Оставляем для быстрого предпросмотра
+
+# Параметры для обработки больших файлов
+CHUNK_SIZE_MS = 30000  # 30 секунд на чанк для экономии памяти
+OVERLAP_MS = 2000      # 2 секунды перекрытия между чанками
 
 # === Функции обработки ===
 def open_ecg_memmap(path):
@@ -65,6 +70,9 @@ def detect_r_peaks_streaming(mm, total, ch, fs, chunk_size=10000, overlap=2000, 
         # Корректируем позиции пиков относительно начала файла
         peaks += start
         
+        # Фильтруем пики, которые выходят за границы файла
+        peaks = peaks[(peaks >= 0) & (peaks < total)]
+        
         # Добавляем пики (исключаем дубликаты в области перекрытия)
         if all_peaks:
             # Исключаем пики в области перекрытия
@@ -91,6 +99,17 @@ def highpass_filter(data, fs, cutoff=0.5):
     normal_cutoff = cutoff / nyquist
     b, a = butter(2, normal_cutoff, btype='high', analog=False)
     return filtfilt(b, a, data)
+
+def downsample_for_display(data, fs_original, fs_target):
+    """Понижение частоты дискретизации для отображения"""
+    if fs_original <= fs_target:
+        return data
+    
+    # Вычисляем коэффициент понижения
+    downsample_factor = int(fs_original / fs_target)
+    
+    # Простое понижение частоты дискретизации (каждый N-й сэмпл)
+    return data[::downsample_factor]
 
 def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, search_window_ms=50, notch_enabled=True):
     """
@@ -184,6 +203,59 @@ def average_complex(ecg, peaks, fs, window_ms=700):
     if not segs:
         return None, None
     A = np.vstack(segs)
+    mean = A.mean(axis=0)
+    t = np.linspace(-window_ms/2, window_ms/2, mean.size)
+    return t, mean
+
+def average_complex_from_peaks(mm, total, peaks, fs, window_ms=700):
+    """Усреднение комплекса из пиков, извлекая данные из memmap"""
+    if len(peaks) < 2:
+        return None, None
+    
+    half = int(window_ms * fs / 1000 / 2)
+    complexes = []
+    
+    for peak in peaks:
+        # Проверяем, что пик находится в допустимых границах
+        if peak < 0 or peak >= total:
+            continue
+            
+        start = max(0, peak - half)
+        end = min(total, peak + half)
+        
+        # Проверяем, что у нас достаточно данных для комплекса
+        if end - start >= half:  # Минимум половина окна
+            try:
+                # Извлекаем данные из memmap
+                raw = extract_channel(mm, total, 0, start, end - start).astype(np.float64)
+                ecg = raw * ((2*2.4)/(2**24)) * 1e3
+                
+                # Применяем фильтры
+                ecg = highpass_filter(ecg, fs, cutoff=0.5)
+                ecg = notch_filter(ecg, fs)
+                
+                # Дополняем до полного размера если нужно
+                if len(ecg) < 2 * half:
+                    # Дополняем нулями до полного размера
+                    padding = 2 * half - len(ecg)
+                    if start == 0:  # Дополняем справа
+                        ecg = np.pad(ecg, (0, padding), mode='constant')
+                    else:  # Дополняем слева
+                        ecg = np.pad(ecg, (padding, 0), mode='constant')
+                
+                complexes.append(ecg)
+            except Exception as e:
+                print(f"Ошибка при обработке пика {peak}: {e}")
+                continue
+    
+    if not complexes:
+        return None, None
+    
+    # Приводим все комплексы к одинаковому размеру
+    min_length = min(len(c) for c in complexes)
+    complexes = [c[:min_length] for c in complexes]
+    
+    A = np.vstack(complexes)
     mean = A.mean(axis=0)
     t = np.linspace(-window_ms/2, window_ms/2, mean.size)
     return t, mean
@@ -519,6 +591,9 @@ class ECGApp(tk.Tk):
         # Вычисляем параметры
         good_peaks = [r for r in self.r_peaks if not any(a<=r/FS<=b for a,b in self.bad_regions)]
         
+        # Вычисляем общую длительность записи
+        total_duration = self.total / FS  # в секундах
+        
         if len(good_peaks) > 1:
             rr_intervals = np.diff(np.array(good_peaks)/FS)  # в секундах
             hr_values = 60 / rr_intervals  # ЧСС в ударах в минуту
@@ -533,6 +608,7 @@ class ECGApp(tk.Tk):
 Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ОБЩИЕ ПАРАМЕТРЫ:
+• Длительность записи: {total_duration:.1f} сек ({total_duration/60:.1f} мин)
 • Количество обнаруженных пиков: {len(self.r_peaks)}
 • Количество годных пиков: {len(good_peaks)}
 • Количество ручных пиков: {len(self.manual_peaks)}
@@ -986,7 +1062,9 @@ RR ИНТЕРВАЛЫ:
         # Ручное добавление/удаление пиков
         if self.manual_peak_mode:
             t = ev.xdata
-            sample_idx = int(t * FS)
+            # Конвертируем время отображения в полную частоту дискретизации
+            display_start = int(START_DELAY * FS)
+            sample_idx = display_start + int(t * FS_DISPLAY) * int(FS / FS_DISPLAY)
             
             if ev.button == 3:  # Правый клик - добавить пик
                 # Ищем локальный максимум в окрестности клика
@@ -1009,7 +1087,9 @@ RR ИНТЕРВАЛЫ:
             elif ev.button == 1:  # Левый клик - удалить пик
                 # Ищем ближайший пик
                 if len(self.r_peaks) > 0:
-                    distances = np.abs(self.r_peaks/FS - t)
+                    # Конвертируем время клика в полную частоту дискретизации
+                    click_time_full = sample_idx / FS
+                    distances = np.abs(self.r_peaks/FS - click_time_full)
                     nearest_idx = np.argmin(distances)
                     
                     if distances[nearest_idx] < 0.1:  # 100 мс допуск
@@ -1031,8 +1111,13 @@ RR ИНТЕРВАЛЫ:
         # Выбор комплекса для отображения
         elif self.select_complex_mode and ev.button == 1:
             if len(self.r_peaks) > 0:
+                # Конвертируем время клика в полную частоту дискретизации
+                display_start = int(START_DELAY * FS)
+                click_sample = display_start + int(ev.xdata * FS_DISPLAY) * int(FS / FS_DISPLAY)
+                click_time_full = click_sample / FS
+                
                 # Ищем ближайший пик
-                distances = np.abs(self.r_peaks/FS - ev.xdata)
+                distances = np.abs(self.r_peaks/FS - click_time_full)
                 nearest_idx = np.argmin(distances)
                 
                 if distances[nearest_idx] < 0.1:  # 100 мс допуск
@@ -1062,26 +1147,27 @@ RR ИНТЕРВАЛЫ:
     def compute(self):
         if self.mm is None:
             return
-        raw = extract_channel(self.mm, self.total, 0, int(START_DELAY*FS), READ_COUNT).astype(np.float64)
-        ecg = raw * ((2*2.4)/(2**24)) * 1e3
         
-        # Применяем фильтр высоких частот для устранения плавающей изолинии
-        ecg = highpass_filter(ecg, FS, cutoff=0.5)
+        # Показываем прогресс
+        self.progress_label.config(text="Обработка всей записи...")
+        self.update()
         
-        if self.notch_enabled:
-            ecg = notch_filter(ecg, FS)
-        self.ecg = ecg
-
-        self.r_peaks, filtered, diff_signal, squared, integrated = detect_r_peaks(
-            ecg, FS, 
+        # Обрабатываем всю запись последовательно
+        self.r_peaks = detect_r_peaks_streaming(
+            self.mm, self.total, 0, FS,
+            chunk_size=CHUNK_SIZE_MS,
+            overlap=OVERLAP_MS,
+            progress_callback=self.update_progress,
             sensitivity=self.sensitivity.get(),
             min_rr_ms=self.min_rr_ms.get(),
             window_ms=self.window_ms.get(),
             search_window_ms=self.search_window_ms.get(),
             notch_enabled=self.notch_enabled
         )
+        
         # HR по годным пикам (исключаем плохие регионы)
         good = [r for r in self.r_peaks if not any(a<=r/FS<=b for a,b in self.bad_regions)]
+        
         # Обновляем информацию о пиках
         self.peaks_label.config(text=f"Пики: {len(self.r_peaks)}")
         
@@ -1092,9 +1178,24 @@ RR ИНТЕРВАЛЫ:
         else:
             self.hr_label.config(text="ЧСС: -- bpm")
 
+        # Для отображения берем только часть данных (первые 100 секунд)
+        display_start = int(START_DELAY * FS)
+        display_count = min(READ_COUNT, self.total - display_start)
+        raw = extract_channel(self.mm, self.total, 0, display_start, display_count).astype(np.float64)
+        ecg_full = raw * ((2*2.4)/(2**24)) * 1e3
+        
+        # Применяем фильтры для отображения на полной частоте
+        ecg_full = highpass_filter(ecg_full, FS, cutoff=0.5)
+        if self.notch_enabled:
+            ecg_full = notch_filter(ecg_full, FS)
+        
+        # Понижаем частоту дискретизации для отображения
+        self.ecg = downsample_for_display(ecg_full, FS, FS_DISPLAY)
+
         self.draw_raw()
         
-        t_avg, avg = average_complex(ecg, good, FS)
+        # Создаем усредненный комплекс из всех пиков
+        t_avg, avg = average_complex_from_peaks(self.mm, self.total, good, FS)
         
         # Создаем маркеры ЭКГ для ручного позиционирования
         if avg is not None:
@@ -1116,27 +1217,57 @@ RR ИНТЕРВАЛЫ:
         self.canvas_sp.draw()
 
         self.draw_selected()
+        
+        # Очищаем прогресс
+        self.progress_label.config(text="")
+    
+    def update_progress(self, progress):
+        """Обновление индикатора прогресса"""
+        self.progress_label.config(text=f"Прогресс: {progress:.1f}%")
+        self.update()
 
     def draw_raw(self):
         self.ax_raw.cla()
-        t = np.arange(len(self.ecg)) / FS
+        t = np.arange(len(self.ecg)) / FS_DISPLAY  # Используем пониженную частоту для времени
         self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
         
-        # Отображаем автоматически найденные пики красным
+        # Отображаем автоматически найденные пики красным (только те, что попадают в отображаемый диапазон)
+        display_start = int(START_DELAY * FS)
+        display_end = display_start + len(self.ecg) * int(FS / FS_DISPLAY)  # Учитываем понижение частоты
+        
         auto_peaks = [i for i, peak in enumerate(self.r_peaks) if i not in self.manual_peaks]
         if auto_peaks:
             auto_peak_positions = self.r_peaks[auto_peaks]
-            self.ax_raw.plot(auto_peak_positions/FS, self.ecg[auto_peak_positions], 'ro', markersize=3, label='Автоматические пики')
+            # Фильтруем пики, которые попадают в отображаемый диапазон
+            visible_peaks = auto_peak_positions[(auto_peak_positions >= display_start) & (auto_peak_positions < display_end)]
+            if len(visible_peaks) > 0:
+                # Корректируем позиции относительно начала отображения и понижаем частоту
+                visible_peaks_adjusted = (visible_peaks - display_start) / int(FS / FS_DISPLAY)
+                # Находим соответствующие значения сигнала
+                peak_indices = visible_peaks_adjusted.astype(int)
+                peak_indices = peak_indices[(peak_indices >= 0) & (peak_indices < len(self.ecg))]
+                if len(peak_indices) > 0:
+                    self.ax_raw.plot(peak_indices / FS_DISPLAY, self.ecg[peak_indices], 'ro', markersize=3, label='Автоматические пики')
         
         # Отображаем ручные пики зеленым
         if self.manual_peaks:
             manual_peak_positions = self.r_peaks[list(self.manual_peaks)]
-            self.ax_raw.plot(manual_peak_positions/FS, self.ecg[manual_peak_positions], 'go', markersize=4, label='Ручные пики')
+            visible_manual_peaks = manual_peak_positions[(manual_peak_positions >= display_start) & (manual_peak_positions < display_end)]
+            if len(visible_manual_peaks) > 0:
+                visible_manual_peaks_adjusted = (visible_manual_peaks - display_start) / int(FS / FS_DISPLAY)
+                peak_indices = visible_manual_peaks_adjusted.astype(int)
+                peak_indices = peak_indices[(peak_indices >= 0) & (peak_indices < len(self.ecg))]
+                if len(peak_indices) > 0:
+                    self.ax_raw.plot(peak_indices / FS_DISPLAY, self.ecg[peak_indices], 'go', markersize=4, label='Ручные пики')
         
         # Отображаем выбранный пик синим
         if self.selected_idx is not None and self.selected_idx < len(self.r_peaks):
             selected_peak = self.r_peaks[self.selected_idx]
-            self.ax_raw.plot(selected_peak/FS, self.ecg[selected_peak], 'bo', markersize=6, label='Выбранный пик')
+            if display_start <= selected_peak < display_end:
+                selected_peak_adjusted = (selected_peak - display_start) / int(FS / FS_DISPLAY)
+                peak_index = int(selected_peak_adjusted)
+                if 0 <= peak_index < len(self.ecg):
+                    self.ax_raw.plot(peak_index / FS_DISPLAY, self.ecg[peak_index], 'bo', markersize=6, label='Выбранный пик')
         
         for patch in self.region_patches:
             self.ax_raw.add_patch(patch)

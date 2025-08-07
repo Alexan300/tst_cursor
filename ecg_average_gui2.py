@@ -38,43 +38,95 @@ def extract_channel(mm, total, ch, start, count):
         offset += SAMPLE_SIZE
     return arr
 
+def detect_r_peaks_streaming(mm, total, ch, fs, chunk_size=10000, overlap=2000, progress_callback=None, **kwargs):
+    """
+    Последовательная детекция R-пиков для больших файлов
+    """
+    all_peaks = []
+    chunk_samples = int(chunk_size * fs / 1000)  # размер чанка в сэмплах
+    overlap_samples = int(overlap * fs / 1000)   # перекрытие в сэмплах
+    
+    for start in range(0, total, chunk_samples - overlap_samples):
+        end = min(start + chunk_samples, total)
+        
+        # Извлекаем чанк данных
+        chunk = extract_channel(mm, total, ch, start, end - start)
+        chunk = chunk.astype(np.float64) * ((2*2.4)/(2**24)) * 1e3
+        
+        # Применяем фильтры
+        chunk = highpass_filter(chunk, fs, cutoff=0.5)
+        if kwargs.get('notch_enabled', True):
+            chunk = notch_filter(chunk, fs)
+        
+        # Детектируем пики в чанке
+        peaks, _, _, _, _ = detect_r_peaks(chunk, fs, **kwargs)
+        
+        # Корректируем позиции пиков относительно начала файла
+        peaks += start
+        
+        # Добавляем пики (исключаем дубликаты в области перекрытия)
+        if all_peaks:
+            # Исключаем пики в области перекрытия
+            overlap_start = start + overlap_samples
+            peaks = peaks[peaks >= overlap_start]
+        
+        all_peaks.extend(peaks)
+        
+        # Обновляем прогресс через callback
+        if progress_callback:
+            progress = (end / total) * 100
+            progress_callback(progress)
+    
+    return np.array(all_peaks)
+
 def notch_filter(data, fs, freq=50.0, Q=30.0):
     b, a = iirnotch(freq, Q, fs)
     return filtfilt(b, a, data)
 
-def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, search_window_ms=50):
+def highpass_filter(data, fs, cutoff=0.5):
+    """Фильтр высоких частот для устранения плавающей изолинии"""
+    from scipy.signal import butter, filtfilt
+    nyquist = fs / 2
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(2, normal_cutoff, btype='high', analog=False)
+    return filtfilt(b, a, data)
+
+def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, search_window_ms=50, notch_enabled=True):
     """
-    Алгоритм Томсона (Pan-Tompkins) для детекции R-пиков в ЭКГ
+    Улучшенный алгоритм Томсона (Pan-Tompkins) для детекции R-пиков в ЭКГ
     
     Параметры:
     - sensitivity: чувствительность (0.1-2.0, по умолчанию 1.0)
     - min_rr_ms: минимальное расстояние между пиками в мс (по умолчанию 200)
     - window_ms: размер окна интегрирования в мс (по умолчанию 120)
     - search_window_ms: окно поиска точного пика в мс (по умолчанию 50)
+    - notch_enabled: применять ли notch фильтр (по умолчанию True)
     """
-    # 1. Полосовой фильтр (5-15 Гц для QRS)
     from scipy.signal import butter, filtfilt
     
-    # Нормализация частоты дискретизации
+    # 1. Предварительная фильтрация - устранение плавающей изолинии
+    ecg_filtered = highpass_filter(ecg, fs, cutoff=0.5)
+    
+    # 2. Полосовой фильтр (5-15 Гц для QRS)
     nyquist = fs / 2
     low = 5 / nyquist
     high = 15 / nyquist
     b, a = butter(2, [low, high], btype='band')
-    filtered = filtfilt(b, a, ecg)
+    filtered = filtfilt(b, a, ecg_filtered)
     
-    # 2. Дифференцирование
+    # 3. Дифференцирование
     diff_signal = np.diff(filtered)
     
-    # 3. Возведение в квадрат
+    # 4. Возведение в квадрат
     squared = diff_signal ** 2
     
-    # 4. Интегрирование с окном
+    # 5. Интегрирование с окном
     window_size = int(window_ms * fs / 1000)
     integrated = np.convolve(squared, np.ones(window_size), mode='same')
     
-    # 5. Адаптивный порог с учетом чувствительности
-    # Начальный порог
-    threshold_i1 = (0.6 / sensitivity) * np.max(integrated)
+    # 6. Улучшенный адаптивный порог
+    # Используем медиану вместо максимума для более стабильного порога
+    threshold_i1 = (0.6 / sensitivity) * np.percentile(integrated, 95)
     threshold_i2 = 0.6 * threshold_i1
     
     # Списки для хранения пиков
@@ -85,9 +137,12 @@ def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, searc
     # Минимальное расстояние между пиками
     min_rr = int(min_rr_ms * fs / 1000)
     
-    # Поиск пиков
-    for i in range(1, len(integrated) - 1):
-        if integrated[i] > integrated[i-1] and integrated[i] > integrated[i+1]:
+    # 7. Поиск пиков с улучшенной логикой
+    for i in range(2, len(integrated) - 2):
+        # Проверяем локальный максимум с более строгими условиями
+        if (integrated[i] > integrated[i-1] and integrated[i] > integrated[i+1] and
+            integrated[i] > integrated[i-2] and integrated[i] > integrated[i+2]):
+            
             if integrated[i] > threshold_i1:
                 # Проверяем минимальное расстояние
                 if not r_peaks or (i - r_peaks[-1]) > min_rr:
@@ -96,16 +151,15 @@ def detect_r_peaks(ecg, fs, sensitivity=1.0, min_rr_ms=200, window_ms=120, searc
             elif integrated[i] > threshold_i2:
                 noise_peaks.append(i)
     
-    # 6. Адаптивное обновление порогов
+    # 8. Адаптивное обновление порогов
     if len(signal_peaks) > 8:
-        # Обновляем пороги каждые 8 пиков
         signal_level = np.mean([integrated[peak] for peak in signal_peaks[-8:]])
         noise_level = np.mean([integrated[peak] for peak in noise_peaks[-8:]]) if noise_peaks else signal_level * 0.5
         
         threshold_i1 = (noise_level + 0.25 * (signal_level - noise_level)) / sensitivity
         threshold_i2 = 0.5 * threshold_i1
     
-    # 7. Поиск точных позиций R-пиков в оригинальном сигнале
+    # 9. Поиск точных позиций R-пиков в оригинальном сигнале
     final_peaks = []
     search_window = int(search_window_ms * fs / 1000)
     
@@ -222,6 +276,7 @@ class ECGApp(tk.Tk):
         self.min_rr_ms = tk.IntVar(value=200)
         self.window_ms = tk.IntVar(value=120)
         self.search_window_ms = tk.IntVar(value=50)
+        self.auto_recompute = tk.BooleanVar(value=False)  # Контроль автоматического пересчета
 
         # --- Разметка grid ---
         self.rowconfigure(0, weight=3)
@@ -243,6 +298,9 @@ class ECGApp(tk.Tk):
         
         self.peaks_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="Пики: 0", background='#fff')
         self.peaks_label.place(relx=0.01, rely=0.05)
+        
+        self.progress_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="", background='#fff')
+        self.progress_label.place(relx=0.01, rely=0.09)
 
         # SpanSelector и события мыши
         self.span = SpanSelector(self.ax_raw, self.onselect_region, 'horizontal', useblit=True,
@@ -316,6 +374,9 @@ class ECGApp(tk.Tk):
         self.search_label = ttk.Label(param_row2, text="50")
         self.search_label.pack(side='left', padx=5)
         
+        # Чекбокс для автоматического пересчета
+        ttk.Checkbutton(param_row2, text="Автопересчет", variable=self.auto_recompute).pack(side='left', padx=10)
+        
         # --- Панель кнопок ---
         ctrl = ttk.Frame(self)
         ctrl.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
@@ -325,6 +386,7 @@ class ECGApp(tk.Tk):
         ttk.Button(ctrl, text='Выбрать комплекс', command=self.toggle_select_complex).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Обновить', command=self.compute).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Сброс параметров', command=self.reset_tompson_params).pack(side='left', padx=5)
+        ttk.Button(ctrl, text='Полная обработка', command=self.full_processing).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Copy Screenshot', command=self.copy_screenshot).pack(side='left', padx=5)
 
     # --- Методы GUI ---
@@ -360,8 +422,8 @@ class ECGApp(tk.Tk):
         self.window_label.config(text=f"{self.window_ms.get()}")
         self.search_label.config(text=f"{self.search_window_ms.get()}")
         
-        # Автоматически пересчитываем при изменении параметров
-        if self.mm is not None:
+        # Пересчитываем только если включен автоматический режим
+        if self.auto_recompute.get() and self.mm is not None:
             self.compute()
 
     def reset_tompson_params(self):
@@ -439,6 +501,58 @@ class ECGApp(tk.Tk):
                 messagebox.showinfo("Успех", "Параметры загружены успешно!")
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось загрузить параметры: {str(e)}")
+
+    def full_processing(self):
+        """Полная обработка файла с последовательной детекцией пиков"""
+        if self.mm is None:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите файл ЭКГ")
+            return
+        
+        try:
+            # Показываем диалог прогресса
+            progress_window = tk.Toplevel(self)
+            progress_window.title("Обработка файла")
+            progress_window.geometry("300x150")
+            progress_window.transient(self)
+            progress_window.grab_set()
+            
+            progress_label = ttk.Label(progress_window, text="Обработка файла...")
+            progress_label.pack(pady=20)
+            
+            progress_bar = ttk.Progressbar(progress_window, mode='determinate', maximum=100)
+            progress_bar.pack(pady=10, padx=20, fill='x')
+            
+            def update_progress(progress):
+                progress_bar['value'] = progress
+                progress_label.config(text=f"Обработано: {progress:.1f}%")
+                progress_window.update()
+            
+            # Обновляем GUI
+            progress_window.update()
+            
+            # Выполняем последовательную обработку
+            self.r_peaks = detect_r_peaks_streaming(
+                self.mm, self.total, 0, FS,
+                chunk_size=10000,  # 10 секунд
+                overlap=2000,      # 2 секунды перекрытия
+                progress_callback=update_progress,
+                sensitivity=self.sensitivity.get(),
+                min_rr_ms=self.min_rr_ms.get(),
+                window_ms=self.window_ms.get(),
+                search_window_ms=self.search_window_ms.get(),
+                notch_enabled=self.notch_enabled
+            )
+            
+            # Закрываем окно прогресса
+            progress_window.destroy()
+            
+            # Обновляем отображение
+            self.compute()
+            
+            messagebox.showinfo("Успех", f"Обработано {len(self.r_peaks)} пиков")
+            
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при обработке: {str(e)}")
 
     def clear_markup(self):
         # удалить патчи
@@ -519,6 +633,10 @@ class ECGApp(tk.Tk):
             return
         raw = extract_channel(self.mm, self.total, 0, int(START_DELAY*FS), READ_COUNT).astype(np.float64)
         ecg = raw * ((2*2.4)/(2**24)) * 1e3
+        
+        # Применяем фильтр высоких частот для устранения плавающей изолинии
+        ecg = highpass_filter(ecg, FS, cutoff=0.5)
+        
         if self.notch_enabled:
             ecg = notch_filter(ecg, FS)
         self.ecg = ecg
@@ -528,7 +646,8 @@ class ECGApp(tk.Tk):
             sensitivity=self.sensitivity.get(),
             min_rr_ms=self.min_rr_ms.get(),
             window_ms=self.window_ms.get(),
-            search_window_ms=self.search_window_ms.get()
+            search_window_ms=self.search_window_ms.get(),
+            notch_enabled=self.notch_enabled
         )
         # HR по годным пикам
         good = [r for i,r in enumerate(self.r_peaks)

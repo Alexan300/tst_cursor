@@ -196,42 +196,7 @@ def copy_image_to_clipboard(img):
     win32clipboard.SetClipboardData(win32con.CF_DIB, data)
     win32clipboard.CloseClipboard()
 
-def plot_tompson_stages(ax, ecg, peaks, filtered, diff_signal, squared, integrated, fs):
-    """
-    Отображение этапов алгоритма Томсона
-    """
-    ax.clear()
-    
-    # Показываем только первые 5 секунд для наглядности
-    t_max = 5.0
-    n_samples = int(t_max * fs)
-    t = np.arange(min(n_samples, len(ecg))) / fs
-    
-    # Нормализация сигналов для отображения
-    ecg_norm = ecg[:len(t)] / np.max(np.abs(ecg[:len(t)]))
-    filtered_norm = filtered[:len(t)] / np.max(np.abs(filtered[:len(t)])) if len(filtered) >= len(t) else filtered / np.max(np.abs(filtered))
-    diff_norm = diff_signal[:len(t)-1] / np.max(np.abs(diff_signal[:len(t)-1])) if len(diff_signal) >= len(t)-1 else diff_signal / np.max(np.abs(diff_signal))
-    squared_norm = squared[:len(t)-1] / np.max(squared[:len(t)-1]) if len(squared) >= len(t)-1 else squared / np.max(squared)
-    integrated_norm = integrated[:len(t)] / np.max(integrated[:len(t)]) if len(integrated) >= len(t) else integrated / np.max(integrated)
-    
-    # Смещение для отображения
-    offset = 2.5
-    ax.plot(t, ecg_norm + offset*4, 'b-', linewidth=0.8, label='Исходный ЭКГ')
-    ax.plot(t, filtered_norm + offset*3, 'g-', linewidth=0.8, label='Полосовой фильтр')
-    ax.plot(t[:-1], diff_norm + offset*2, 'r-', linewidth=0.8, label='Дифференцирование')
-    ax.plot(t[:-1], squared_norm + offset*1, 'm-', linewidth=0.8, label='Квадрат')
-    ax.plot(t, integrated_norm, 'k-', linewidth=0.8, label='Интегрирование')
-    
-    # Отмечаем найденные пики
-    peaks_in_window = peaks[peaks < n_samples]
-    if len(peaks_in_window) > 0:
-        ax.plot(peaks_in_window/fs, integrated_norm[peaks_in_window], 'ro', markersize=4, label='R-пики')
-    
-    ax.set_title('Этапы алгоритма Томсона')
-    ax.set_ylabel('Амплитуда (норм.)')
-    ax.set_xlabel('Время (с)')
-    ax.legend(loc='upper right', fontsize=8)
-    ax.grid(True, alpha=0.3)
+
 
 def on_close(app):
     plt.close('all')
@@ -248,6 +213,8 @@ class ECGApp(tk.Tk):
         
         # --- Меню ---
         menubar = tk.Menu(self)
+        
+        # Меню Файл
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="Открыть запись...", command=self.open_file)
         filemenu.add_separator()
@@ -256,6 +223,14 @@ class ECGApp(tk.Tk):
         filemenu.add_separator()
         filemenu.add_command(label="Выход", command=lambda: on_close(self))
         menubar.add_cascade(label="Файл", menu=filemenu)
+        
+        # Меню Настройки
+        settingsmenu = tk.Menu(menubar, tearoff=0)
+        settingsmenu.add_command(label="Параметры алгоритма Томсона...", command=self.show_tompson_settings)
+        settingsmenu.add_separator()
+        settingsmenu.add_command(label="Сброс параметров", command=self.reset_tompson_params)
+        menubar.add_cascade(label="Настройки", menu=settingsmenu)
+        
         self.config(menu=menubar)
 
         # --- Данные и состояния ---
@@ -282,9 +257,8 @@ class ECGApp(tk.Tk):
         self.rowconfigure(0, weight=3)
         self.rowconfigure(1, weight=2)
         self.rowconfigure(2, weight=2)
-        self.rowconfigure(3, weight=2)
-        self.rowconfigure(4, weight=1)
-        self.rowconfigure(5, weight=0)
+        self.rowconfigure(3, weight=1)
+        self.rowconfigure(4, weight=0)
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
 
@@ -322,70 +296,24 @@ class ECGApp(tk.Tk):
         self.canvas_sp = FigureCanvasTkAgg(self.fig_sp, master=self)
         self.canvas_sp.get_tk_widget().grid(row=1, column=1, sticky='nsew', padx=5, pady=5)
 
-        # --- Этапы алгоритма Томсона ---
-        self.fig_tom, self.ax_tom = plt.subplots(figsize=(8,2))
-        plt.tight_layout()
-        self.canvas_tom = FigureCanvasTkAgg(self.fig_tom, master=self)
-        self.canvas_tom.get_tk_widget().grid(row=2, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
+
 
         # --- Выбранный комплекс ---
         self.fig_sel, self.ax_sel = plt.subplots(figsize=(8,2))
         plt.tight_layout()
         self.canvas_sel = FigureCanvasTkAgg(self.fig_sel, master=self)
-        self.canvas_sel.get_tk_widget().grid(row=3, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
+        self.canvas_sel.get_tk_widget().grid(row=2, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
-        # --- Панель управления алгоритмом Томсона ---
-        tompson_frame = ttk.LabelFrame(self, text="Параметры алгоритма Томсона")
-        tompson_frame.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
-        
-        # Первая строка параметров
-        param_row1 = ttk.Frame(tompson_frame)
-        param_row1.pack(fill='x', padx=5, pady=2)
-        
-        ttk.Label(param_row1, text="Чувствительность:").pack(side='left', padx=5)
-        sensitivity_scale = ttk.Scale(param_row1, from_=0.1, to=2.0, variable=self.sensitivity, 
-                                     orient='horizontal', length=150, command=self.on_param_change)
-        sensitivity_scale.pack(side='left', padx=5)
-        self.sensitivity_label = ttk.Label(param_row1, text="1.0")
-        self.sensitivity_label.pack(side='left', padx=5)
-        
-        ttk.Label(param_row1, text="Мин. RR (мс):").pack(side='left', padx=5)
-        min_rr_scale = ttk.Scale(param_row1, from_=100, to=500, variable=self.min_rr_ms, 
-                                orient='horizontal', length=150, command=self.on_param_change)
-        min_rr_scale.pack(side='left', padx=5)
-        self.min_rr_label = ttk.Label(param_row1, text="200")
-        self.min_rr_label.pack(side='left', padx=5)
-        
-        # Вторая строка параметров
-        param_row2 = ttk.Frame(tompson_frame)
-        param_row2.pack(fill='x', padx=5, pady=2)
-        
-        ttk.Label(param_row2, text="Окно интегрирования (мс):").pack(side='left', padx=5)
-        window_scale = ttk.Scale(param_row2, from_=50, to=200, variable=self.window_ms, 
-                                orient='horizontal', length=150, command=self.on_param_change)
-        window_scale.pack(side='left', padx=5)
-        self.window_label = ttk.Label(param_row2, text="120")
-        self.window_label.pack(side='left', padx=5)
-        
-        ttk.Label(param_row2, text="Окно поиска (мс):").pack(side='left', padx=5)
-        search_scale = ttk.Scale(param_row2, from_=20, to=100, variable=self.search_window_ms, 
-                                orient='horizontal', length=150, command=self.on_param_change)
-        search_scale.pack(side='left', padx=5)
-        self.search_label = ttk.Label(param_row2, text="50")
-        self.search_label.pack(side='left', padx=5)
-        
-        # Чекбокс для автоматического пересчета
-        ttk.Checkbutton(param_row2, text="Автопересчет", variable=self.auto_recompute).pack(side='left', padx=10)
+
         
         # --- Панель кнопок ---
         ctrl = ttk.Frame(self)
-        ctrl.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        ctrl.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(ctrl, text='Notch 50 Hz', command=self.toggle_notch).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Отметить комплекс', command=self.toggle_peak_selector).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Выбрать комплекс', command=self.toggle_select_complex).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Обновить', command=self.compute).pack(side='left', padx=5)
-        ttk.Button(ctrl, text='Сброс параметров', command=self.reset_tompson_params).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Полная обработка', command=self.full_processing).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Copy Screenshot', command=self.copy_screenshot).pack(side='left', padx=5)
 
@@ -552,7 +480,84 @@ class ECGApp(tk.Tk):
             messagebox.showinfo("Успех", f"Обработано {len(self.r_peaks)} пиков")
             
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Ошибка при обработке: {str(e)}")
+                            messagebox.showerror("Ошибка", f"Ошибка при обработке: {str(e)}")
+
+    def show_tompson_settings(self):
+        """Показать окно настроек алгоритма Томсона"""
+        settings_window = tk.Toplevel(self)
+        settings_window.title("Параметры алгоритма Томсона")
+        settings_window.geometry("600x300")
+        settings_window.transient(self)
+        settings_window.grab_set()
+        
+        # Основной фрейм
+        main_frame = ttk.Frame(settings_window, padding="10")
+        main_frame.pack(fill='both', expand=True)
+        
+        # Заголовок
+        ttk.Label(main_frame, text="Настройки алгоритма Томсона", font=('Arial', 12, 'bold')).pack(pady=(0, 20))
+        
+        # Первая строка параметров
+        param_row1 = ttk.Frame(main_frame)
+        param_row1.pack(fill='x', pady=5)
+        
+        ttk.Label(param_row1, text="Чувствительность:", width=20).pack(side='left', padx=5)
+        sensitivity_scale = ttk.Scale(param_row1, from_=0.1, to=2.0, variable=self.sensitivity, 
+                                     orient='horizontal', length=200, command=self.on_param_change)
+        sensitivity_scale.pack(side='left', padx=5)
+        self.sensitivity_label = ttk.Label(param_row1, text="1.0", width=8)
+        self.sensitivity_label.pack(side='left', padx=5)
+        
+        ttk.Label(param_row1, text="Мин. RR (мс):", width=15).pack(side='left', padx=5)
+        min_rr_scale = ttk.Scale(param_row1, from_=100, to=500, variable=self.min_rr_ms, 
+                                orient='horizontal', length=150, command=self.on_param_change)
+        min_rr_scale.pack(side='left', padx=5)
+        self.min_rr_label = ttk.Label(param_row1, text="200", width=8)
+        self.min_rr_label.pack(side='left', padx=5)
+        
+        # Вторая строка параметров
+        param_row2 = ttk.Frame(main_frame)
+        param_row2.pack(fill='x', pady=5)
+        
+        ttk.Label(param_row2, text="Окно интегрирования (мс):", width=20).pack(side='left', padx=5)
+        window_scale = ttk.Scale(param_row2, from_=50, to=200, variable=self.window_ms, 
+                                orient='horizontal', length=200, command=self.on_param_change)
+        window_scale.pack(side='left', padx=5)
+        self.window_label = ttk.Label(param_row2, text="120", width=8)
+        self.window_label.pack(side='left', padx=5)
+        
+        ttk.Label(param_row2, text="Окно поиска (мс):", width=15).pack(side='left', padx=5)
+        search_scale = ttk.Scale(param_row2, from_=20, to=100, variable=self.search_window_ms, 
+                                orient='horizontal', length=150, command=self.on_param_change)
+        search_scale.pack(side='left', padx=5)
+        self.search_label = ttk.Label(param_row2, text="50", width=8)
+        self.search_label.pack(side='left', padx=5)
+        
+        # Чекбокс для автоматического пересчета
+        auto_frame = ttk.Frame(main_frame)
+        auto_frame.pack(fill='x', pady=10)
+        ttk.Checkbutton(auto_frame, text="Автоматический пересчет при изменении параметров", 
+                       variable=self.auto_recompute).pack(side='left', padx=5)
+        
+        # Кнопки
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x', pady=20)
+        
+        ttk.Button(button_frame, text="Применить", command=lambda: [self.compute(), settings_window.destroy()]).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Отмена", command=settings_window.destroy).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Сброс к значениям по умолчанию", command=self.reset_tompson_params).pack(side='right', padx=5)
+        
+        # Описание параметров
+        desc_frame = ttk.LabelFrame(main_frame, text="Описание параметров", padding="10")
+        desc_frame.pack(fill='x', pady=10)
+        
+        desc_text = """
+• Чувствительность (0.1-2.0): Основной параметр контроля детекции. Меньшие значения = более строгая детекция.
+• Мин. RR (100-500 мс): Минимальный интервал между пиками. Помогает избежать множественных детекций.
+• Окно интегрирования (50-200 мс): Размер окна для сглаживания дифференцированного сигнала.
+• Окно поиска (20-100 мс): Окно для поиска точного положения R-пика в исходном сигнале.
+        """
+        ttk.Label(desc_frame, text=desc_text, justify='left').pack(anchor='w')
 
     def clear_markup(self):
         # удалить патчи
@@ -685,10 +690,6 @@ class ECGApp(tk.Tk):
             self.ax_sp.plot(xf[mask], amp[mask], linewidth=1)
         self.ax_sp.set_title('Спектр усреднённого комплекса')
         self.canvas_sp.draw()
-
-        # Отображение этапов алгоритма Томсона
-        plot_tompson_stages(self.ax_tom, ecg, self.r_peaks, filtered, diff_signal, squared, integrated, FS)
-        self.canvas_tom.draw()
 
         self.draw_selected()
 

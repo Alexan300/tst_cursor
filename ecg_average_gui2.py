@@ -11,6 +11,7 @@ from PIL import ImageGrab
 import io
 import win32clipboard
 import win32con
+from datetime import datetime
 
 # === Параметры сигнала ===
 FS = 2000.0
@@ -242,9 +243,19 @@ class ECGApp(tk.Tk):
         self.region_patches = []     # Rectangle-объекты
         self.resizing = None         # (patch, 'left'/'right')
         self.notch_enabled = True
-        self.select_beats = False
-        self.select_complex_mode = False
+        self.manual_peak_mode = False  # режим ручного добавления/удаления пиков
+        self.select_complex_mode = False  # режим выбора комплекса для отображения
         self.selected_idx = None
+        self.manual_peaks = set()    # множество индексов ручно добавленных пиков
+        
+        # Переменные для кнопок
+        self.manual_peak_button = None
+        self.select_complex_button = None
+        
+        # Переменные для измерений
+        self.measurement_mode = False
+        self.measurement_points = []  # список точек измерений [(x, y, label), ...]
+        self.measurement_lines = []   # список линий измерений
         
         # --- Параметры алгоритма Томсона ---
         self.sensitivity = tk.DoubleVar(value=1.0)
@@ -258,7 +269,8 @@ class ECGApp(tk.Tk):
         self.rowconfigure(1, weight=2)
         self.rowconfigure(2, weight=2)
         self.rowconfigure(3, weight=1)
-        self.rowconfigure(4, weight=0)
+        self.rowconfigure(4, weight=1)
+        self.rowconfigure(5, weight=0)
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=1)
 
@@ -289,6 +301,9 @@ class ECGApp(tk.Tk):
         plt.tight_layout()
         self.canvas_avg = FigureCanvasTkAgg(self.fig_avg, master=self)
         self.canvas_avg.get_tk_widget().grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
+        
+        # Подключаем обработчик кликов для усредненного комплекса
+        self.fig_avg.canvas.mpl_connect('button_press_event', self.on_avg_click)
 
         # --- Спектр ---
         self.fig_sp, self.ax_sp = plt.subplots(figsize=(4,2))
@@ -304,15 +319,51 @@ class ECGApp(tk.Tk):
         self.canvas_sel = FigureCanvasTkAgg(self.fig_sel, master=self)
         self.canvas_sel.get_tk_widget().grid(row=2, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
+        # --- Текстовое поле для параметров ---
+        text_frame = ttk.LabelFrame(self, text="Параметры и измерения")
+        text_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        
+        # Создаем текстовое поле с прокруткой
+        text_container = ttk.Frame(text_frame)
+        text_container.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        self.text_widget = tk.Text(text_container, height=8, width=80, wrap='word')
+        scrollbar = ttk.Scrollbar(text_container, orient='vertical', command=self.text_widget.yview)
+        self.text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        self.text_widget.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Кнопки для работы с текстом
+        text_buttons = ttk.Frame(text_frame)
+        text_buttons.pack(fill='x', padx=5, pady=2)
+        
+        ttk.Button(text_buttons, text="Очистить", command=self.clear_text).pack(side='left', padx=5)
+        ttk.Button(text_buttons, text="Сохранить в файл", command=self.save_text_to_file).pack(side='left', padx=5)
+        ttk.Button(text_buttons, text="Обновить параметры", command=self.update_text_parameters).pack(side='right', padx=5)
 
+        
         
         # --- Панель кнопок ---
         ctrl = ttk.Frame(self)
-        ctrl.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        ctrl.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(ctrl, text='Notch 50 Hz', command=self.toggle_notch).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector).pack(side='left', padx=5)
-        ttk.Button(ctrl, text='Отметить комплекс', command=self.toggle_peak_selector).pack(side='left', padx=5)
-        ttk.Button(ctrl, text='Выбрать комплекс', command=self.toggle_select_complex).pack(side='left', padx=5)
+        
+        # Кнопки с визуальной индикацией состояния
+        self.manual_peak_button = tk.Button(ctrl, text='Отметить комплекс', command=self.toggle_peak_selector,
+                                           bg='lightgray', relief='raised', bd=2)
+        self.manual_peak_button.pack(side='left', padx=5)
+        
+        self.select_complex_button = tk.Button(ctrl, text='Выбрать комплекс', command=self.toggle_select_complex,
+                                               bg='lightgray', relief='raised', bd=2)
+        self.select_complex_button.pack(side='left', padx=5)
+        
+        # Кнопка для измерений на усредненном комплексе
+        self.measurement_button = tk.Button(ctrl, text='Измерения', command=self.toggle_measurement_mode,
+                                           bg='lightgray', relief='raised', bd=2)
+        self.measurement_button.pack(side='left', padx=5)
+        
         ttk.Button(ctrl, text='Обновить', command=self.compute).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Полная обработка', command=self.full_processing).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Copy Screenshot', command=self.copy_screenshot).pack(side='left', padx=5)
@@ -334,13 +385,197 @@ class ECGApp(tk.Tk):
 
     def activate_region_selector(self):
         if self.mm is not None:
+            # Отключаем другие режимы
+            self.manual_peak_mode = False
+            self.select_complex_mode = False
+            
+            # Обновляем состояние кнопок
+            self.manual_peak_button.config(bg='lightgray', relief='raised')
+            self.select_complex_button.config(bg='lightgray', relief='raised')
+            
+            # Активируем SpanSelector
             self.span.set_active(True)
 
     def toggle_peak_selector(self):
-        self.select_beats = not self.select_beats
+        """Переключение режима ручного добавления/удаления пиков"""
+        self.manual_peak_mode = not self.manual_peak_mode
+        self.select_complex_mode = False  # отключаем другой режим
+        
+        # Обновляем состояние кнопок
+        if self.manual_peak_mode:
+            self.manual_peak_button.config(bg='lightgreen', relief='sunken')
+            self.select_complex_button.config(bg='lightgray', relief='raised')
+        else:
+            self.manual_peak_button.config(bg='lightgray', relief='raised')
+        
+        # Отключаем SpanSelector при активном режиме ручной разметки
+        self.span.set_active(False)
 
     def toggle_select_complex(self):
+        """Переключение режима выбора комплекса для отображения"""
         self.select_complex_mode = not self.select_complex_mode
+        self.manual_peak_mode = False  # отключаем другой режим
+        
+        # Обновляем состояние кнопок
+        if self.select_complex_mode:
+            self.select_complex_button.config(bg='lightblue', relief='sunken')
+            self.manual_peak_button.config(bg='lightgray', relief='raised')
+        else:
+            self.select_complex_button.config(bg='lightgray', relief='raised')
+        
+        # Отключаем SpanSelector при активном режиме выбора комплекса
+        self.span.set_active(False)
+
+    def toggle_measurement_mode(self):
+        """Переключение режима измерений на усредненном комплексе"""
+        self.measurement_mode = not self.measurement_mode
+        self.manual_peak_mode = False
+        self.select_complex_mode = False
+        
+        # Обновляем состояние кнопок
+        if self.measurement_mode:
+            self.measurement_button.config(bg='lightyellow', relief='sunken')
+            self.manual_peak_button.config(bg='lightgray', relief='raised')
+            self.select_complex_button.config(bg='lightgray', relief='raised')
+            messagebox.showinfo("Режим измерений", 
+                              "Включен режим измерений.\n"
+                              "Кликните на усредненном комплексе для добавления маркеров.\n"
+                              "Правый клик - удалить маркер")
+        else:
+            self.measurement_button.config(bg='lightgray', relief='raised')
+        
+        # Отключаем SpanSelector
+        self.span.set_active(False)
+
+    def clear_text(self):
+        """Очистить текстовое поле"""
+        self.text_widget.delete(1.0, tk.END)
+
+    def save_text_to_file(self):
+        """Сохранить содержимое текстового поля в файл"""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Сохранить параметры"
+        )
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.text_widget.get(1.0, tk.END))
+                messagebox.showinfo("Успех", "Файл сохранен успешно!")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {str(e)}")
+
+    def update_text_parameters(self):
+        """Обновить параметры в текстовом поле"""
+        if self.ecg is None or len(self.r_peaks) == 0:
+            messagebox.showwarning("Предупреждение", "Нет данных для анализа")
+            return
+        
+        # Вычисляем параметры
+        good_peaks = [r for r in self.r_peaks if not any(a<=r/FS<=b for a,b in self.bad_regions)]
+        
+        if len(good_peaks) > 1:
+            rr_intervals = np.diff(np.array(good_peaks)/FS)  # в секундах
+            hr_values = 60 / rr_intervals  # ЧСС в ударах в минуту
+            
+            hr_mean = np.mean(hr_values)
+            hr_min = np.min(hr_values)
+            hr_max = np.max(hr_values)
+            hr_std = np.std(hr_values)
+            
+            # Формируем текст
+            text_content = f"""=== АНАЛИЗ ЭКГ ===
+Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+ОБЩИЕ ПАРАМЕТРЫ:
+• Количество обнаруженных пиков: {len(self.r_peaks)}
+• Количество годных пиков: {len(good_peaks)}
+• Количество ручных пиков: {len(self.manual_peaks)}
+
+ЧАСТОТА СЕРДЕЧНЫХ СОКРАЩЕНИЙ (ЧСС):
+• Средняя ЧСС: {hr_mean:.1f} ± {hr_std:.1f} уд/мин
+• Минимальная ЧСС: {hr_min:.1f} уд/мин
+• Максимальная ЧСС: {hr_max:.1f} уд/мин
+• Вариабельность ЧСС: {hr_std:.1f} уд/мин
+
+RR ИНТЕРВАЛЫ:
+• Средний RR интервал: {np.mean(rr_intervals)*1000:.1f} мс
+• Минимальный RR интервал: {np.min(rr_intervals)*1000:.1f} мс
+• Максимальный RR интервал: {np.max(rr_intervals)*1000:.1f} мс
+• Стандартное отклонение RR: {np.std(rr_intervals)*1000:.1f} мс
+
+ПАРАМЕТРЫ АЛГОРИТМА ТОМСОНА:
+• Чувствительность: {self.sensitivity.get():.2f}
+• Минимальное расстояние между пиками: {self.min_rr_ms.get()} мс
+• Окно интегрирования: {self.window_ms.get()} мс
+• Окно поиска: {self.search_window_ms.get()} мс
+
+ИЗМЕРЕНИЯ НА УСРЕДНЕННОМ КОМПЛЕКСЕ:
+"""
+            
+            # Добавляем измерения
+            if self.measurement_points:
+                for i, (x, y, label) in enumerate(self.measurement_points, 1):
+                    text_content += f"• {label}: {x:.1f} мс, {y:.2f} мВ\n"
+            
+            # Добавляем в текстовое поле
+            self.text_widget.delete(1.0, tk.END)
+            self.text_widget.insert(1.0, text_content)
+        else:
+            messagebox.showwarning("Предупреждение", "Недостаточно пиков для анализа")
+
+    def on_avg_click(self, event):
+        """Обработчик кликов на усредненном комплексе"""
+        if not self.measurement_mode or event.inaxes != self.ax_avg:
+            return
+        
+        if event.button == 1:  # Левый клик - добавить маркер
+            # Добавляем точку измерения
+            self.measurement_points.append((event.xdata, event.ydata, f"Точка {len(self.measurement_points)+1}"))
+            
+            # Отображаем маркер
+            self.ax_avg.plot(event.xdata, event.ydata, 'ro', markersize=6)
+            self.ax_avg.annotate(f"Точка {len(self.measurement_points)}", 
+                               (event.xdata, event.ydata), 
+                               xytext=(5, 5), textcoords='offset points',
+                               fontsize=8, bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+            
+            self.canvas_avg.draw()
+            
+        elif event.button == 3:  # Правый клик - удалить ближайший маркер
+            if self.measurement_points:
+                # Находим ближайшую точку
+                distances = [(abs(event.xdata - x), i) for i, (x, y, _) in enumerate(self.measurement_points)]
+                distances.sort()
+                nearest_idx = distances[0][1]
+                
+                # Удаляем точку
+                del self.measurement_points[nearest_idx]
+                
+                # Перерисовываем график
+                self.draw_average_complex()
+
+    def draw_average_complex(self, t_avg=None, avg=None):
+        """Отрисовка усредненного комплекса с маркерами"""
+        self.ax_avg.cla()
+        
+        if avg is not None:
+            self.ax_avg.plot(t_avg, avg, linewidth=1, color='blue')
+            
+            # Отображаем маркеры измерений
+            for i, (x, y, label) in enumerate(self.measurement_points, 1):
+                self.ax_avg.plot(x, y, 'ro', markersize=6)
+                self.ax_avg.annotate(f"Точка {i}", 
+                                   (x, y), 
+                                   xytext=(5, 5), textcoords='offset points',
+                                   fontsize=8, bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+        
+        self.ax_avg.set_title('Усреднённый комплекс')
+        self.ax_avg.set_xlabel('Время (мс)')
+        self.ax_avg.set_ylabel('Амплитуда (мВ)')
+        self.ax_avg.grid(True, alpha=0.3)
+        self.canvas_avg.draw()
 
     def on_param_change(self, event=None):
         """Обработчик изменения параметров алгоритма Томсона"""
@@ -566,8 +801,8 @@ class ECGApp(tk.Tk):
             except: pass
         self.region_patches = []
         self.bad_regions = []
-        self.bad_beats = set()
-        self.manual_beats = set()
+        self.manual_peaks = set()
+        self.selected_idx = None
         self.compute()
 
     def onselect_region(self, x0, x1):
@@ -582,6 +817,7 @@ class ECGApp(tk.Tk):
     def on_click(self, ev):
         if ev.inaxes != self.ax_raw:
             return
+            
         # попытка редактирования region
         for idx, patch in enumerate(self.region_patches):
             contains, _ = patch.contains(ev)
@@ -600,19 +836,63 @@ class ECGApp(tk.Tk):
                     del self.bad_regions[idx]
                     self.canvas_raw.draw()
                     return
-        # правка пиков
-        if self.select_beats and ev.button==3:
+        
+        # Ручное добавление/удаление пиков
+        if self.manual_peak_mode:
             t = ev.xdata
-            idx = np.argmin(np.abs(self.r_peaks/FS - t))
-            if abs(self.r_peaks[idx]/FS - t) < 0.05:
-                if idx in self.bad_beats: self.bad_beats.remove(idx)
-                else: self.bad_beats.add(idx)
+            sample_idx = int(t * FS)
+            
+            if ev.button == 3:  # Правый клик - добавить пик
+                # Ищем локальный максимум в окрестности клика
+                search_window = int(0.1 * FS)  # 100 мс окно поиска
+                start = max(0, sample_idx - search_window)
+                end = min(len(self.ecg), sample_idx + search_window)
+                
+                # Находим локальный максимум
+                local_max_idx = start + np.argmax(self.ecg[start:end])
+                
+                # Добавляем пик в список
+                self.r_peaks = np.append(self.r_peaks, local_max_idx)
+                self.r_peaks = np.sort(self.r_peaks)  # сортируем
+                # Находим новый индекс добавленного пика
+                new_idx = np.where(self.r_peaks == local_max_idx)[0][0]
+                self.manual_peaks.add(new_idx)  # запоминаем как ручной
+                
                 self.draw_raw()
-        # выбор комплекса
-        if self.select_complex_mode and ev.button==1:
-            idx = np.argmin(np.abs(self.r_peaks/FS - ev.xdata))
-            self.selected_idx = idx
-            self.draw_selected()
+                
+            elif ev.button == 1:  # Левый клик - удалить пик
+                # Ищем ближайший пик
+                if len(self.r_peaks) > 0:
+                    distances = np.abs(self.r_peaks/FS - t)
+                    nearest_idx = np.argmin(distances)
+                    
+                    if distances[nearest_idx] < 0.1:  # 100 мс допуск
+                        # Удаляем пик
+                        self.r_peaks = np.delete(self.r_peaks, nearest_idx)
+                        # Обновляем индексы ручных пиков
+                        self.manual_peaks = {i-1 if i > nearest_idx else i for i in self.manual_peaks}
+                        self.manual_peaks.discard(nearest_idx)
+                        
+                        # Обновляем индекс выбранного пика
+                        if self.selected_idx is not None:
+                            if self.selected_idx == nearest_idx:
+                                self.selected_idx = None
+                            elif self.selected_idx > nearest_idx:
+                                self.selected_idx -= 1
+                        
+                        self.draw_raw()
+        
+        # Выбор комплекса для отображения
+        elif self.select_complex_mode and ev.button == 1:
+            if len(self.r_peaks) > 0:
+                # Ищем ближайший пик
+                distances = np.abs(self.r_peaks/FS - ev.xdata)
+                nearest_idx = np.argmin(distances)
+                
+                if distances[nearest_idx] < 0.1:  # 100 мс допуск
+                    self.selected_idx = nearest_idx
+                    self.draw_selected()
+                    self.draw_raw()  # Обновляем отображение для показа выбранного пика
 
     def on_motion(self, ev):
         if not self.resizing or ev.inaxes!=self.ax_raw:
@@ -654,9 +934,8 @@ class ECGApp(tk.Tk):
             search_window_ms=self.search_window_ms.get(),
             notch_enabled=self.notch_enabled
         )
-        # HR по годным пикам
-        good = [r for i,r in enumerate(self.r_peaks)
-                if i not in self.bad_beats and not any(a<=r/FS<=b for a,b in self.bad_regions)]
+        # HR по годным пикам (исключаем плохие регионы)
+        good = [r for r in self.r_peaks if not any(a<=r/FS<=b for a,b in self.bad_regions)]
         # Обновляем информацию о пиках
         self.peaks_label.config(text=f"Пики: {len(self.r_peaks)}")
         
@@ -669,14 +948,9 @@ class ECGApp(tk.Tk):
 
         self.draw_raw()
         
-        allb = np.unique(np.concatenate([good, list(self.manual_beats)])).astype(int)
-        t_avg, avg = average_complex(ecg, allb, FS)
+        t_avg, avg = average_complex(ecg, good, FS)
 
-        self.ax_avg.cla()
-        if avg is not None:
-            self.ax_avg.plot(t_avg, avg, linewidth=1)
-        self.ax_avg.set_title('Усреднённый комплекс')
-        self.canvas_avg.draw()
+        self.draw_average_complex(t_avg, avg)
 
         self.ax_sp.cla()
         if avg is not None:
@@ -697,9 +971,29 @@ class ECGApp(tk.Tk):
         self.ax_raw.cla()
         t = np.arange(len(self.ecg)) / FS
         self.ax_raw.plot(t, self.ecg, color='black', linewidth=0.8)
-        self.ax_raw.plot(self.r_peaks/FS, self.ecg[self.r_peaks], 'ro', markersize=3)
+        
+        # Отображаем автоматически найденные пики красным
+        auto_peaks = [i for i, peak in enumerate(self.r_peaks) if i not in self.manual_peaks]
+        if auto_peaks:
+            auto_peak_positions = self.r_peaks[auto_peaks]
+            self.ax_raw.plot(auto_peak_positions/FS, self.ecg[auto_peak_positions], 'ro', markersize=3, label='Автоматические пики')
+        
+        # Отображаем ручные пики зеленым
+        if self.manual_peaks:
+            manual_peak_positions = self.r_peaks[list(self.manual_peaks)]
+            self.ax_raw.plot(manual_peak_positions/FS, self.ecg[manual_peak_positions], 'go', markersize=4, label='Ручные пики')
+        
+        # Отображаем выбранный пик синим
+        if self.selected_idx is not None and self.selected_idx < len(self.r_peaks):
+            selected_peak = self.r_peaks[self.selected_idx]
+            self.ax_raw.plot(selected_peak/FS, self.ecg[selected_peak], 'bo', markersize=6, label='Выбранный пик')
+        
         for patch in self.region_patches:
             self.ax_raw.add_patch(patch)
+        
+        if len(self.r_peaks) > 0:
+            self.ax_raw.legend(loc='upper right', fontsize=8)
+        
         self.canvas_raw.draw()
 
     def draw_selected(self):

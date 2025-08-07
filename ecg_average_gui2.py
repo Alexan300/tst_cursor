@@ -188,6 +188,46 @@ def average_complex(ecg, peaks, fs, window_ms=700):
     t = np.linspace(-window_ms/2, window_ms/2, mean.size)
     return t, mean
 
+def create_ecg_markers(t, signal):
+    """
+    Создание фиксированных маркеров ЭКГ для ручного позиционирования
+    """
+    markers = {}
+    
+    # Находим примерный центр комплекса (максимум сигнала)
+    center_idx = np.argmax(signal)
+    center_time = t[center_idx]
+    
+    # Создаем маркеры с примерными позициями
+    # Начало P (примерно 200 мс перед центром)
+    p_start_idx = max(0, np.where(t >= center_time - 0.2)[0][0] if len(np.where(t >= center_time - 0.2)[0]) > 0 else 0)
+    markers['начало P'] = (t[p_start_idx], signal[p_start_idx])
+    
+    # Конец P (примерно 80 мс перед центром)
+    p_end_idx = max(0, np.where(t >= center_time - 0.08)[0][0] if len(np.where(t >= center_time - 0.08)[0]) > 0 else 0)
+    markers['конец P'] = (t[p_end_idx], signal[p_end_idx])
+    
+    # Q (примерно 40 мс перед центром)
+    q_idx = max(0, np.where(t >= center_time - 0.04)[0][0] if len(np.where(t >= center_time - 0.04)[0]) > 0 else 0)
+    markers['Q'] = (t[q_idx], signal[q_idx])
+    
+    # R (центр)
+    markers['R'] = (t[center_idx], signal[center_idx])
+    
+    # S (примерно 40 мс после центра)
+    s_idx = min(len(signal)-1, np.where(t >= center_time + 0.04)[0][0] if len(np.where(t >= center_time + 0.04)[0]) > 0 else len(signal)-1)
+    markers['S'] = (t[s_idx], signal[s_idx])
+    
+    # Начало T (примерно 80 мс после центра)
+    t_start_idx = min(len(signal)-1, np.where(t >= center_time + 0.08)[0][0] if len(np.where(t >= center_time + 0.08)[0]) > 0 else len(signal)-1)
+    markers['начало T'] = (t[t_start_idx], signal[t_start_idx])
+    
+    # Конец T (примерно 200 мс после центра)
+    t_end_idx = min(len(signal)-1, np.where(t >= center_time + 0.2)[0][0] if len(np.where(t >= center_time + 0.2)[0]) > 0 else len(signal)-1)
+    markers['конец T'] = (t[t_end_idx], signal[t_end_idx])
+    
+    return markers
+
 def copy_image_to_clipboard(img):
     output = io.BytesIO()
     img.convert("RGB").save(output, "BMP")
@@ -256,6 +296,11 @@ class ECGApp(tk.Tk):
         self.measurement_mode = False
         self.measurement_points = []  # список точек измерений [(x, y, label), ...]
         self.measurement_lines = []   # список линий измерений
+        
+        # Переменные для автоматических маркеров ЭКГ
+        self.ecg_markers = {}  # словарь с автоматическими маркерами {'P': (x, y), 'Q': (x, y), ...}
+        self.manual_markers = {}  # словарь с ручно скорректированными маркерами
+        self.marker_edit_mode = False  # режим редактирования маркеров
         
         # --- Параметры алгоритма Томсона ---
         self.sensitivity = tk.DoubleVar(value=1.0)
@@ -364,6 +409,11 @@ class ECGApp(tk.Tk):
                                            bg='lightgray', relief='raised', bd=2)
         self.measurement_button.pack(side='left', padx=5)
         
+        # Кнопка для редактирования маркеров ЭКГ
+        self.marker_edit_button = tk.Button(ctrl, text='Редактировать маркеры', command=self.toggle_marker_edit,
+                                           bg='lightgray', relief='raised', bd=2)
+        self.marker_edit_button.pack(side='left', padx=5)
+        
         ttk.Button(ctrl, text='Обновить', command=self.compute).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Полная обработка', command=self.full_processing).pack(side='left', padx=5)
         ttk.Button(ctrl, text='Copy Screenshot', command=self.copy_screenshot).pack(side='left', padx=5)
@@ -447,6 +497,29 @@ class ECGApp(tk.Tk):
         # Отключаем SpanSelector
         self.span.set_active(False)
 
+    def toggle_marker_edit(self):
+        """Переключение режима редактирования маркеров ЭКГ"""
+        self.marker_edit_mode = not self.marker_edit_mode
+        self.measurement_mode = False
+        self.manual_peak_mode = False
+        self.select_complex_mode = False
+        
+        # Обновляем состояние кнопок
+        if self.marker_edit_mode:
+            self.marker_edit_button.config(bg='lightcoral', relief='sunken')
+            self.measurement_button.config(bg='lightgray', relief='raised')
+            self.manual_peak_button.config(bg='lightgray', relief='raised')
+            self.select_complex_button.config(bg='lightgray', relief='raised')
+            messagebox.showinfo("Редактирование маркеров", 
+                              "Включен режим редактирования маркеров ЭКГ.\n"
+                              "Кликните на маркер для его перемещения.\n"
+                              "Правый клик - удалить маркер")
+        else:
+            self.marker_edit_button.config(bg='lightgray', relief='raised')
+        
+        # Отключаем SpanSelector
+        self.span.set_active(False)
+
     def clear_text(self):
         """Очистить текстовое поле"""
         self.text_widget.delete(1.0, tk.END)
@@ -514,8 +587,41 @@ RR ИНТЕРВАЛЫ:
 ИЗМЕРЕНИЯ НА УСРЕДНЕННОМ КОМПЛЕКСЕ:
 """
             
+            # Добавляем маркеры ЭКГ
+            all_markers = {**self.ecg_markers, **self.manual_markers}
+            if all_markers:
+                text_content += "\nМАРКЕРЫ ЭКГ:\n"
+                marker_order = ['начало P', 'конец P', 'Q', 'R', 'S', 'начало T', 'конец T']
+                for marker_name in marker_order:
+                    if marker_name in all_markers:
+                        x, y = all_markers[marker_name]
+                        status = "(ручная)" if marker_name in self.manual_markers else "(авто)"
+                        text_content += f"• {marker_name} {status}: {x:.1f} мс, {y:.2f} мВ\n"
+                
+                # Вычисляем интервалы
+                if 'конец P' in all_markers and 'Q' in all_markers:
+                    pq_interval = (all_markers['Q'][0] - all_markers['конец P'][0]) * 1000  # в мс
+                    text_content += f"• PQ интервал: {pq_interval:.1f} мс\n"
+                
+                if 'Q' in all_markers and 'S' in all_markers:
+                    qrs_duration = (all_markers['S'][0] - all_markers['Q'][0]) * 1000  # в мс
+                    text_content += f"• QRS длительность: {qrs_duration:.1f} мс\n"
+                
+                if 'S' in all_markers and 'начало T' in all_markers:
+                    st_interval = (all_markers['начало T'][0] - all_markers['S'][0]) * 1000  # в мс
+                    text_content += f"• ST интервал: {st_interval:.1f} мс\n"
+                
+                if 'начало P' in all_markers and 'конец P' in all_markers:
+                    p_duration = (all_markers['конец P'][0] - all_markers['начало P'][0]) * 1000  # в мс
+                    text_content += f"• Длительность P: {p_duration:.1f} мс\n"
+                
+                if 'начало T' in all_markers and 'конец T' in all_markers:
+                    t_duration = (all_markers['конец T'][0] - all_markers['начало T'][0]) * 1000  # в мс
+                    text_content += f"• Длительность T: {t_duration:.1f} мс\n"
+            
             # Добавляем измерения
             if self.measurement_points:
+                text_content += "\nДОПОЛНИТЕЛЬНЫЕ ИЗМЕРЕНИЯ:\n"
                 for i, (x, y, label) in enumerate(self.measurement_points, 1):
                     text_content += f"• {label}: {x:.1f} мс, {y:.2f} мВ\n"
             
@@ -527,34 +633,68 @@ RR ИНТЕРВАЛЫ:
 
     def on_avg_click(self, event):
         """Обработчик кликов на усредненном комплексе"""
-        if not self.measurement_mode or event.inaxes != self.ax_avg:
+        if event.inaxes != self.ax_avg:
             return
         
-        if event.button == 1:  # Левый клик - добавить маркер
-            # Добавляем точку измерения
-            self.measurement_points.append((event.xdata, event.ydata, f"Точка {len(self.measurement_points)+1}"))
-            
-            # Отображаем маркер
-            self.ax_avg.plot(event.xdata, event.ydata, 'ro', markersize=6)
-            self.ax_avg.annotate(f"Точка {len(self.measurement_points)}", 
-                               (event.xdata, event.ydata), 
-                               xytext=(5, 5), textcoords='offset points',
-                               fontsize=8, bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
-            
-            self.canvas_avg.draw()
-            
-        elif event.button == 3:  # Правый клик - удалить ближайший маркер
-            if self.measurement_points:
-                # Находим ближайшую точку
-                distances = [(abs(event.xdata - x), i) for i, (x, y, _) in enumerate(self.measurement_points)]
-                distances.sort()
-                nearest_idx = distances[0][1]
+        # Режим измерений
+        if self.measurement_mode:
+            if event.button == 1:  # Левый клик - добавить маркер
+                # Добавляем точку измерения
+                self.measurement_points.append((event.xdata, event.ydata, f"Точка {len(self.measurement_points)+1}"))
                 
-                # Удаляем точку
-                del self.measurement_points[nearest_idx]
+                # Отображаем маркер
+                self.ax_avg.plot(event.xdata, event.ydata, 'ro', markersize=6)
+                self.ax_avg.annotate(f"Точка {len(self.measurement_points)}", 
+                                   (event.xdata, event.ydata), 
+                                   xytext=(5, 5), textcoords='offset points',
+                                   fontsize=8, bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
                 
-                # Перерисовываем график
-                self.draw_average_complex()
+                self.canvas_avg.draw()
+                
+            elif event.button == 3:  # Правый клик - удалить ближайший маркер
+                if self.measurement_points:
+                    # Находим ближайшую точку
+                    distances = [(abs(event.xdata - x), i) for i, (x, y, _) in enumerate(self.measurement_points)]
+                    distances.sort()
+                    nearest_idx = distances[0][1]
+                    
+                    # Удаляем точку
+                    del self.measurement_points[nearest_idx]
+                    
+                    # Перерисовываем график
+                    self.draw_average_complex()
+        
+        # Режим редактирования маркеров ЭКГ
+        elif self.marker_edit_mode:
+            if event.button == 1:  # Левый клик - переместить маркер
+                # Находим ближайший маркер ЭКГ
+                all_markers = {**self.ecg_markers, **self.manual_markers}
+                if all_markers:
+                    distances = [(abs(event.xdata - x), marker_name) for marker_name, (x, y) in all_markers.items()]
+                    distances.sort()
+                    nearest_marker = distances[0][1]
+                    
+                    # Перемещаем маркер
+                    self.manual_markers[nearest_marker] = (event.xdata, event.ydata)
+                    
+                    # Перерисовываем график
+                    self.draw_average_complex()
+                    
+            elif event.button == 3:  # Правый клик - удалить маркер
+                all_markers = {**self.ecg_markers, **self.manual_markers}
+                if all_markers:
+                    distances = [(abs(event.xdata - x), marker_name) for marker_name, (x, y) in all_markers.items()]
+                    distances.sort()
+                    nearest_marker = distances[0][1]
+                    
+                    # Удаляем маркер
+                    if nearest_marker in self.manual_markers:
+                        del self.manual_markers[nearest_marker]
+                    if nearest_marker in self.ecg_markers:
+                        del self.ecg_markers[nearest_marker]
+                    
+                    # Перерисовываем график
+                    self.draw_average_complex()
 
     def draw_average_complex(self, t_avg=None, avg=None):
         """Отрисовка усредненного комплекса с маркерами"""
@@ -570,12 +710,38 @@ RR ИНТЕРВАЛЫ:
                                    (x, y), 
                                    xytext=(5, 5), textcoords='offset points',
                                    fontsize=8, bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+            
+            # Отображаем маркеры ЭКГ
+            self.draw_ecg_markers(t_avg, avg)
         
         self.ax_avg.set_title('Усреднённый комплекс')
         self.ax_avg.set_xlabel('Время (мс)')
         self.ax_avg.set_ylabel('Амплитуда (мВ)')
         self.ax_avg.grid(True, alpha=0.3)
         self.canvas_avg.draw()
+
+    def draw_ecg_markers(self, t_avg, avg):
+        """Отрисовка маркеров ЭКГ"""
+        # Цвета для разных маркеров
+        colors = {
+            'начало P': 'lightgreen', 'конец P': 'green',
+            'Q': 'orange', 'R': 'red', 'S': 'purple',
+            'начало T': 'lightblue', 'конец T': 'blue'
+        }
+        
+        # Объединяем автоматические и ручные маркеры
+        all_markers = {**self.ecg_markers, **self.manual_markers}
+        
+        for marker_name, (x, y) in all_markers.items():
+            if marker_name in colors:
+                color = colors[marker_name]
+                # Ручные маркеры рисуем больше
+                size = 8 if marker_name in self.manual_markers else 6
+                self.ax_avg.plot(x, y, 'o', color=color, markersize=size, markeredgecolor='black', markeredgewidth=1)
+                self.ax_avg.annotate(marker_name, (x, y), 
+                                   xytext=(5, 5), textcoords='offset points',
+                                   fontsize=8, fontweight='bold', color=color,
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
 
     def on_param_change(self, event=None):
         """Обработчик изменения параметров алгоритма Томсона"""
@@ -803,6 +969,9 @@ RR ИНТЕРВАЛЫ:
         self.bad_regions = []
         self.manual_peaks = set()
         self.selected_idx = None
+        self.measurement_points = []
+        self.ecg_markers = {}
+        self.manual_markers = {}
         self.compute()
 
     def onselect_region(self, x0, x1):
@@ -949,7 +1118,11 @@ RR ИНТЕРВАЛЫ:
         self.draw_raw()
         
         t_avg, avg = average_complex(ecg, good, FS)
-
+        
+        # Создаем маркеры ЭКГ для ручного позиционирования
+        if avg is not None:
+            self.ecg_markers = create_ecg_markers(t_avg, avg)
+        
         self.draw_average_complex(t_avg, avg)
 
         self.ax_sp.cla()

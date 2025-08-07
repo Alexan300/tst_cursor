@@ -106,3 +106,4 @@ pip install numpy scipy matplotlib pillow pywin32
 
 При возникновении проблем или вопросов обращайтесь к разработчику.
 АС Малиновский. 
+www.cardiosave.net

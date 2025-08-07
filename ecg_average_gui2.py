@@ -376,6 +376,9 @@ class ECGApp(tk.Tk):
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.is_processing = False
         
+        # Флаг управления навигацией matplotlib
+        self._navigation_disabled = False
+        
         # --- Параметры алгоритма Томсона ---
         self.sensitivity = tk.DoubleVar(value=1.0)
         self.min_rr_ms = tk.IntVar(value=200)
@@ -426,15 +429,23 @@ class ECGApp(tk.Tk):
         self.progress_label = ttk.Label(self.canvas_raw.get_tk_widget(), text="", background='#fff')
         self.progress_label.place(relx=0.01, rely=0.09)
 
-        # SpanSelector и события мыши
-        self.span = SpanSelector(self.ax_raw, self.onselect_region, 'horizontal', useblit=True,
-                                 props=dict(alpha=0.3, facecolor='red'), button=1, minspan=0.01)
-        self.span.set_active(False)
+        # Переменные для выделения региона
+        self.region_selecting = False
+        self.region_start = None
+        self.region_end = None
         
         # Подключаем события мыши к canvas
         self.canvas_raw.mpl_connect('button_press_event', self.on_click)
         self.canvas_raw.mpl_connect('motion_notify_event', self.on_motion)
         self.canvas_raw.mpl_connect('button_release_event', self.on_release)
+        
+        # Подключаем события навигации matplotlib для сброса режимов
+        self.canvas_raw.mpl_connect('key_press_event', self.on_navigation_event)
+        
+        # Блокируем события matplotlib при активных режимах
+        self.canvas_raw.mpl_connect('button_press_event', self.block_matplotlib_events)
+        
+
 
         # --- Усреднённый комплекс ---
         self.fig_avg, self.ax_avg = plt.subplots(figsize=(4,2))
@@ -488,7 +499,9 @@ class ECGApp(tk.Tk):
         ctrl = ttk.Frame(self)
         ctrl.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(ctrl, text='Notch 50 Hz', command=self.toggle_notch).pack(side='left', padx=5)
-        ttk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector).pack(side='left', padx=5)
+        self.region_selector_button = tk.Button(ctrl, text='Выделить регион', command=self.activate_region_selector,
+                                               bg='lightgray', relief='raised', bd=2)
+        self.region_selector_button.pack(side='left', padx=5)
         
         # Кнопки с визуальной индикацией состояния
         self.manual_peak_button = tk.Button(ctrl, text='Отметить комплекс', command=self.toggle_peak_selector,
@@ -557,8 +570,8 @@ class ECGApp(tk.Tk):
             # Отрисовываем полную запись с пиками
             self.draw_raw()
             
-            # Устанавливаем начальные границы просмотра
-            self.ax_raw.set_xlim(0, min(100, len(full_ecg) / FS))  # Первые 100 секунд
+            # Устанавливаем начальные границы просмотра - 100 секунд
+            self.ax_raw.set_xlim(0, min(100, len(full_ecg) / FS))
             self.canvas_raw.draw()
             
             # Автоматически детектируем пики для отображения
@@ -600,11 +613,15 @@ class ECGApp(tk.Tk):
             # Обновляем метки
             self.peaks_label.config(text=f"Пики: {len(self.r_peaks)}")
             
-            # Вычисляем ЧСС
-            if len(self.r_peaks) > 1:
-                rr_intervals = np.diff(self.r_peaks) / FS * 1000  # в мс
+            # Вычисляем ЧСС только из годных пиков (исключаем плохие регионы)
+            good_peaks = [r for r in self.r_peaks if not any(a<=r/FS<=b for a,b in self.bad_regions)]
+            
+            if len(good_peaks) > 1:
+                rr_intervals = np.diff(np.array(good_peaks)) / FS * 1000  # в мс
                 hr = 60000 / np.mean(rr_intervals)  # ударов в минуту
                 self.hr_label.config(text=f"ЧСС: {hr:.1f} bpm")
+            else:
+                self.hr_label.config(text="ЧСС: -- bpm")
             
             self.progress_label.config(text="")
             
@@ -618,58 +635,94 @@ class ECGApp(tk.Tk):
 
     def activate_region_selector(self):
         if self.mm is not None:
+            # Переключаем режим выделения региона
+            if not hasattr(self, 'region_selector_active'):
+                self.region_selector_active = False
+                
+            self.region_selector_active = not self.region_selector_active
+            
             # Отключаем другие режимы
             self.manual_peak_mode = False
             self.select_complex_mode = False
+            self.measurement_mode = False
+            self.marker_edit_mode = False
             
             # Обновляем состояние кнопок
-            self.manual_peak_button.config(bg='lightgray', relief='raised')
-            self.select_complex_button.config(bg='lightgray', relief='raised')
-            
-            # Активируем SpanSelector
-            self.span.set_active(True)
+            if self.region_selector_active:
+                self.region_selector_button.config(bg='lightcoral', relief='sunken')
+                self.manual_peak_button.config(bg='lightgray', relief='raised')
+                self.select_complex_button.config(bg='lightgray', relief='raised')
+                self.measurement_button.config(bg='lightgray', relief='raised')
+                self.marker_edit_button.config(bg='lightgray', relief='raised')
+                
+                # Полностью отключаем инструменты навигации matplotlib
+                self.disable_matplotlib_navigation()
+            else:
+                self.region_selector_button.config(bg='lightgray', relief='raised')
+                
+                # Включаем инструменты навигации matplotlib
+                self.enable_matplotlib_navigation()
 
     def toggle_peak_selector(self):
         """Переключение режима ручного добавления/удаления пиков"""
         self.manual_peak_mode = not self.manual_peak_mode
         self.select_complex_mode = False  # отключаем другой режим
+        self.measurement_mode = False
+        self.marker_edit_mode = False
         
         # Обновляем состояние кнопок
         if self.manual_peak_mode:
             self.manual_peak_button.config(bg='lightgreen', relief='sunken')
+            self.region_selector_button.config(bg='lightgray', relief='raised')
             self.select_complex_button.config(bg='lightgray', relief='raised')
+            self.measurement_button.config(bg='lightgray', relief='raised')
+            self.marker_edit_button.config(bg='lightgray', relief='raised')
         else:
             self.manual_peak_button.config(bg='lightgray', relief='raised')
         
         # Отключаем SpanSelector при активном режиме ручной разметки
         self.span.set_active(False)
+        
+        # Полностью отключаем инструменты навигации matplotlib
+        self.disable_matplotlib_navigation()
 
     def toggle_select_complex(self):
         """Переключение режима выбора комплекса для отображения"""
         self.select_complex_mode = not self.select_complex_mode
         self.manual_peak_mode = False  # отключаем другой режим
+        self.measurement_mode = False
+        self.marker_edit_mode = False
         
         # Обновляем состояние кнопок
         if self.select_complex_mode:
             self.select_complex_button.config(bg='lightblue', relief='sunken')
+            self.region_selector_button.config(bg='lightgray', relief='raised')
             self.manual_peak_button.config(bg='lightgray', relief='raised')
+            self.measurement_button.config(bg='lightgray', relief='raised')
+            self.marker_edit_button.config(bg='lightgray', relief='raised')
         else:
             self.select_complex_button.config(bg='lightgray', relief='raised')
         
         # Отключаем SpanSelector при активном режиме выбора комплекса
         self.span.set_active(False)
+        
+        # Полностью отключаем инструменты навигации matplotlib
+        self.disable_matplotlib_navigation()
 
     def toggle_measurement_mode(self):
         """Переключение режима измерений на усредненном комплексе"""
         self.measurement_mode = not self.measurement_mode
         self.manual_peak_mode = False
         self.select_complex_mode = False
+        self.marker_edit_mode = False
         
         # Обновляем состояние кнопок
         if self.measurement_mode:
             self.measurement_button.config(bg='lightyellow', relief='sunken')
+            self.region_selector_button.config(bg='lightgray', relief='raised')
             self.manual_peak_button.config(bg='lightgray', relief='raised')
             self.select_complex_button.config(bg='lightgray', relief='raised')
+            self.marker_edit_button.config(bg='lightgray', relief='raised')
             messagebox.showinfo("Режим измерений", 
                               "Включен режим измерений.\n"
                               "Левый клик - добавить маркер ЭКГ (P, Q, R, S, T)\n"
@@ -679,6 +732,10 @@ class ECGApp(tk.Tk):
         
         # Отключаем SpanSelector
         self.span.set_active(False)
+        
+        # Отключаем инструменты навигации matplotlib
+        self.toolbar_raw.pan()
+        self.toolbar_raw.zoom()
 
     def toggle_marker_edit(self):
         """Переключение режима редактирования маркеров ЭКГ"""
@@ -690,6 +747,7 @@ class ECGApp(tk.Tk):
         # Обновляем состояние кнопок
         if self.marker_edit_mode:
             self.marker_edit_button.config(bg='lightcoral', relief='sunken')
+            self.region_selector_button.config(bg='lightgray', relief='raised')
             self.measurement_button.config(bg='lightgray', relief='raised')
             self.manual_peak_button.config(bg='lightgray', relief='raised')
             self.select_complex_button.config(bg='lightgray', relief='raised')
@@ -702,6 +760,92 @@ class ECGApp(tk.Tk):
         
         # Отключаем SpanSelector
         self.span.set_active(False)
+        
+        # Полностью отключаем инструменты навигации matplotlib
+        self.disable_matplotlib_navigation()
+        
+    def on_navigation_event(self, event):
+        """Обработчик событий навигации matplotlib - сбрасывает активные режимы"""
+        # Если пользователь использует инструменты навигации matplotlib, сбрасываем наши режимы
+        if hasattr(event, 'key') and event.key in ['p', 'o', 'home', 'backspace']:
+            self.reset_all_modes()
+            
+    def block_matplotlib_events(self, event):
+        """Блокирует события matplotlib при активных режимах"""
+        # Если активен любой из наших режимов, блокируем события matplotlib
+        if any([self.manual_peak_mode, self.select_complex_mode, self.measurement_mode, 
+                self.marker_edit_mode, getattr(self, 'region_selector_active', False)]):
+            # Блокируем событие, не передавая его дальше
+            return 'break'
+        return None
+        
+
+                
+    def reset_all_modes(self):
+        """Сбрасывает все активные режимы"""
+        self.manual_peak_mode = False
+        self.select_complex_mode = False
+        self.measurement_mode = False
+        self.marker_edit_mode = False
+        self.region_selector_active = False
+        
+        # Обновляем состояние кнопок
+        self.region_selector_button.config(bg='lightgray', relief='raised')
+        self.manual_peak_button.config(bg='lightgray', relief='raised')
+        self.select_complex_button.config(bg='lightgray', relief='raised')
+        self.measurement_button.config(bg='lightgray', relief='raised')
+        self.marker_edit_button.config(bg='lightgray', relief='raised')
+        
+        # Отключаем SpanSelector
+        self.span.set_active(False)
+        
+        # Включаем инструменты навигации matplotlib
+        self.enable_matplotlib_navigation()
+        
+    def disable_matplotlib_navigation(self):
+        """Полностью отключает инструменты навигации matplotlib"""
+        # Принудительно устанавливаем режим "Home" (без навигации)
+        self.toolbar_raw.home()
+        
+        # Отключаем все инструменты навигации
+        self.toolbar_raw.pan()
+        self.toolbar_raw.zoom()
+        
+        # Принудительно отключаем обработчики событий
+        try:
+            # Отключаем обработчики событий навигации
+            self.canvas_raw.toolbar.pan()
+            self.canvas_raw.toolbar.zoom()
+        except:
+            pass
+        
+        # Устанавливаем флаг, что навигация отключена
+        self._navigation_disabled = True
+        
+        # Блокируем кнопки навигации в toolbar
+        for child in self.toolbar_raw.winfo_children():
+            if hasattr(child, 'config'):
+                try:
+                    child.config(state='disabled')
+                except:
+                    pass
+        
+    def enable_matplotlib_navigation(self):
+        """Включает инструменты навигации matplotlib"""
+        # Сбрасываем флаг отключения навигации
+        self._navigation_disabled = False
+        
+        # Включаем инструменты навигации
+        self.toolbar_raw.pan()
+        self.toolbar_raw.zoom()
+        
+        # Разблокируем кнопки навигации в toolbar
+        for child in self.toolbar_raw.winfo_children():
+            if hasattr(child, 'config'):
+                try:
+                    child.config(state='normal')
+                except:
+                    pass
 
     def clear_text(self):
         """Очистить текстовое поле"""
@@ -1167,26 +1311,48 @@ RR ИНТЕРВАЛЫ:
         self.avg_data = None
         self.compute()
 
-    def onselect_region(self, x0, x1):
-        start, end = min(x0,x1), max(x0,x1)
-        self.bad_regions.append((start, end))
-        
-        # Получаем границы по Y для полной записи
-        if hasattr(self, 'full_ecg') and self.full_ecg is not None:
-            y_min = np.min(self.full_ecg)
-            y_max = np.max(self.full_ecg)
-        else:
-            y_min, y_max = -1, 1
-        
-        patch = Rectangle((start, y_min), end-start, y_max-y_min,
-                          color='red', alpha=0.3)
-        self.ax_raw.add_patch(patch)
-        self.region_patches.append(patch)
-        self.canvas_raw.draw()
+
 
     def on_click(self, ev):
         if ev.inaxes != self.ax_raw:
             return
+            
+        # Обработка выделения региона
+        if getattr(self, 'region_selector_active', False):
+            if ev.button == 1:  # Левый клик
+                if not self.region_selecting:
+                    # Начинаем выделение региона
+                    self.region_selecting = True
+                    self.region_start = ev.xdata
+                    print(f"Начало выделения региона: {self.region_start:.2f} сек")
+                else:
+                    # Завершаем выделение региона
+                    self.region_selecting = False
+                    self.region_end = ev.xdata
+                    print(f"Конец выделения региона: {self.region_end:.2f} сек")
+                    
+                    # Создаем регион
+                    start, end = min(self.region_start, self.region_end), max(self.region_start, self.region_end)
+                    self.bad_regions.append((start, end))
+                    
+                    # Создаем визуальный патч
+                    if hasattr(self, 'full_ecg') and self.full_ecg is not None:
+                        y_min = np.min(self.full_ecg)
+                        y_max = np.max(self.full_ecg)
+                    else:
+                        y_min, y_max = -1, 1
+                    
+                    patch = Rectangle((start, y_min), end-start, y_max-y_min,
+                                      color='red', alpha=0.3)
+                    self.ax_raw.add_patch(patch)
+                    self.region_patches.append(patch)
+                    self.canvas_raw.draw()
+                    
+                    # Сбрасываем режим выделения
+                    self.region_selector_active = False
+                    self.region_selector_button.config(bg='lightgray', relief='raised')
+                    self.enable_matplotlib_navigation()
+                    return
             
         # попытка редактирования region
         for idx, patch in enumerate(self.region_patches):

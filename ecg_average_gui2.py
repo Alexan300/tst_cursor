@@ -379,6 +379,9 @@ class ECGApp(tk.Tk):
         # Флаг управления навигацией matplotlib
         self._navigation_disabled = False
         
+        # Флаг для отслеживания первой отрисовки графика
+        self._first_draw_complete = False
+        
         # --- Параметры алгоритма Томсона ---
         self.sensitivity = tk.DoubleVar(value=1.0)
         self.min_rr_ms = tk.IntVar(value=200)
@@ -570,9 +573,10 @@ class ECGApp(tk.Tk):
             # Отрисовываем полную запись с пиками
             self.draw_raw()
             
-            # Устанавливаем начальные границы просмотра - 100 секунд
-            self.ax_raw.set_xlim(0, min(100, len(full_ecg) / FS))
-            self.canvas_raw.draw()
+            # Устанавливаем начальные границы просмотра - 100 секунд (только при первой загрузке)
+            if not self._first_draw_complete:
+                self.ax_raw.set_xlim(0, min(100, len(full_ecg) / FS))
+                self.canvas_raw.draw()
             
             # Автоматически детектируем пики для отображения
             self.detect_peaks_for_display()
@@ -1309,6 +1313,10 @@ RR ИНТЕРВАЛЫ:
         self.manual_markers = {}
         self.t_avg_data = None
         self.avg_data = None
+        
+        # Сбрасываем флаг первой отрисовки для нового файла
+        self._first_draw_complete = False
+        
         self.compute()
 
 
@@ -1674,6 +1682,14 @@ RR ИНТЕРВАЛЫ:
         if not hasattr(self, 'full_ecg') or self.full_ecg is None:
             return
             
+        # Сохраняем текущие границы отображения перед очисткой
+        current_xlim = self.ax_raw.get_xlim()
+        current_ylim = self.ax_raw.get_ylim()
+        
+        # Проверяем, нужно ли сохранять границы
+        # Сохраняем только если это не первая отрисовка и границы были изменены пользователем
+        preserve_limits = self._first_draw_complete
+        
         # Очищаем график
         self.ax_raw.cla()
         
@@ -1729,6 +1745,14 @@ RR ИНТЕРВАЛЫ:
         self.ax_raw.set_ylabel('Амплитуда (мВ)')
         self.ax_raw.set_title('Полная запись ЭКГ')
         self.ax_raw.grid(True, alpha=0.3)
+        
+        # Восстанавливаем границы отображения, если они были установлены пользователем
+        if preserve_limits:
+            self.ax_raw.set_xlim(current_xlim)
+            self.ax_raw.set_ylim(current_ylim)
+        
+        # Отмечаем, что первая отрисовка завершена
+        self._first_draw_complete = True
         
         # Обновляем canvas
         self.canvas_raw.draw()

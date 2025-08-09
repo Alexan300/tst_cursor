@@ -728,7 +728,7 @@ class ECGApp(tk.Tk):
             self.marker_edit_button.config(bg='lightgray', relief='raised')
             messagebox.showinfo("Режим измерений", 
                               "Включен режим измерений.\n"
-                              "Левый клик - добавить маркер ЭКГ (P, Q, R, S, T)\n"
+                              "Левый клик - добавить маркер ЭКГ (P_начало, P_конец, Q, R, S, T_начало, T_конец)\n"
                               "Правый клик - удалить ближайший маркер")
         else:
             self.measurement_button.config(bg='lightgray', relief='raised')
@@ -911,33 +911,68 @@ RR ИНТЕРВАЛЫ:
             all_markers = {**self.ecg_markers, **self.manual_markers}
             if all_markers:
                 text_content += "\nМАРКЕРЫ ЭКГ:\n"
-                marker_order = ['P', 'Q', 'R', 'S', 'T']
+                marker_order = ['P_начало', 'P_конец', 'Q', 'R', 'S', 'T_начало', 'T_конец']
+                
+                # Определяем точку отсчета времени (P_начало = 0 мс)
+                p_start_time = None
+                if 'P_начало' in all_markers:
+                    p_start_time = all_markers['P_начало'][0]  # время P_начало в мс относительно центра (R-пик)
+                
                 for marker_name in marker_order:
                     if marker_name in all_markers:
-                        x, y = all_markers[marker_name]
+                        x, y = all_markers[marker_name]  # x в мс относительно центра комплекса (R-пик)
                         status = "(ручная)" if marker_name in self.manual_markers else "(авто)"
-                        text_content += f"• {marker_name} {status}: {x:.1f} мс, {y:.2f} мВ\n"
+                        
+                        # Вычисляем абсолютное время от P_начало
+                        if p_start_time is not None:
+                            abs_time = x - p_start_time  # уже в мс от P_начало
+                            text_content += f"• {marker_name} {status}: {abs_time:.1f} мс, {y:.2f} мВ\n"
+                        else:
+                            # Если P_начало не установлен, показываем относительно центра комплекса (R-пик)
+                            text_content += f"• {marker_name} {status}: {x:.1f} мс (от R-пика), {y:.2f} мВ\n"
                 
-                # Вычисляем интервалы
-                if 'P' in all_markers and 'Q' in all_markers:
-                    pq_interval = (all_markers['Q'][0] - all_markers['P'][0]) * 1000  # в мс
-                    text_content += f"• PQ интервал: {pq_interval:.1f} мс\n"
+                # Вычисляем интервалы и абсолютные времена
+                text_content += "\nИНТЕРВАЛЫ И АБСОЛЮТНЫЕ ВРЕМЕНА (от P_начало = 0 мс):\n"
                 
+                # Длительность P волны
+                if 'P_начало' in all_markers and 'P_конец' in all_markers:
+                    p_duration = all_markers['P_конец'][0] - all_markers['P_начало'][0]  # уже в мс
+                    text_content += f"• Длительность P волны: {p_duration:.1f} мс\n"
+                
+                # PQ интервал (от конца P до начала Q)
+                if 'P_конец' in all_markers and 'Q' in all_markers:
+                    pq_interval = all_markers['Q'][0] - all_markers['P_конец'][0]  # уже в мс
+                    text_content += f"• PQ интервал (изоэлектрический): {pq_interval:.1f} мс\n"
+                
+                # QRS длительность
                 if 'Q' in all_markers and 'S' in all_markers:
-                    qrs_duration = (all_markers['S'][0] - all_markers['Q'][0]) * 1000  # в мс
+                    qrs_duration = all_markers['S'][0] - all_markers['Q'][0]  # уже в мс
                     text_content += f"• QRS длительность: {qrs_duration:.1f} мс\n"
                 
-                if 'S' in all_markers and 'T' in all_markers:
-                    st_interval = (all_markers['T'][0] - all_markers['S'][0]) * 1000  # в мс
-                    text_content += f"• ST интервал: {st_interval:.1f} мс\n"
+                # ST интервал (от S до начала T)
+                if 'S' in all_markers and 'T_начало' in all_markers:
+                    st_interval = all_markers['T_начало'][0] - all_markers['S'][0]  # уже в мс
+                    text_content += f"• ST интервал (изоэлектрический): {st_interval:.1f} мс\n"
                 
-                if 'P' in all_markers and 'R' in all_markers:
-                    pr_interval = (all_markers['R'][0] - all_markers['P'][0]) * 1000  # в мс
-                    text_content += f"• PR интервал: {pr_interval:.1f} мс\n"
+                # Длительность T волны
+                if 'T_начало' in all_markers and 'T_конец' in all_markers:
+                    t_duration = all_markers['T_конец'][0] - all_markers['T_начало'][0]  # уже в мс
+                    text_content += f"• Длительность T волны: {t_duration:.1f} мс\n"
                 
-                if 'R' in all_markers and 'T' in all_markers:
-                    rt_interval = (all_markers['T'][0] - all_markers['R'][0]) * 1000  # в мс
-                    text_content += f"• RT интервал: {rt_interval:.1f} мс\n"
+                # PR интервал (от начала P до R)
+                if 'P_начало' in all_markers and 'R' in all_markers:
+                    pr_interval = all_markers['R'][0] - all_markers['P_начало'][0]  # уже в мс
+                    text_content += f"• PR интервал (общий): {pr_interval:.1f} мс\n"
+                
+                # QT интервал (от Q до конца T)
+                if 'Q' in all_markers and 'T_конец' in all_markers:
+                    qt_interval = all_markers['T_конец'][0] - all_markers['Q'][0]  # уже в мс
+                    text_content += f"• QT интервал (общий): {qt_interval:.1f} мс\n"
+                
+                # Полная длительность кардиоцикла (от P_начало до T_конец)
+                if 'P_начало' in all_markers and 'T_конец' in all_markers:
+                    total_duration = all_markers['T_конец'][0] - all_markers['P_начало'][0]  # уже в мс
+                    text_content += f"• Полная длительность кардиоцикла: {total_duration:.1f} мс\n"
             
             # Добавляем измерения
             if self.measurement_points:
@@ -959,9 +994,9 @@ RR ИНТЕРВАЛЫ:
         # Режим измерений
         if self.measurement_mode:
             if event.button == 1:  # Левый клик - добавить маркер
-                # Определяем какой маркер добавить (P, Q, R, S, T)
+                # Определяем какой маркер добавить (P_начало, P_конец, Q, R, S, T_начало, T_конец)
                 existing_markers = set(self.manual_markers.keys())
-                available_markers = ['P', 'Q', 'R', 'S', 'T']
+                available_markers = ['P_начало', 'P_конец', 'Q', 'R', 'S', 'T_начало', 'T_конец']
                 next_marker = None
                 
                 for marker in available_markers:
@@ -1050,7 +1085,9 @@ RR ИНТЕРВАЛЫ:
         """Отрисовка маркеров ЭКГ"""
         # Цвета для разных маркеров
         colors = {
-            'P': 'green', 'Q': 'orange', 'R': 'red', 'S': 'purple', 'T': 'blue'
+            'P_начало': 'green', 'P_конец': 'darkgreen', 
+            'Q': 'orange', 'R': 'red', 'S': 'purple', 
+            'T_начало': 'blue', 'T_конец': 'darkblue'
         }
         
         # Объединяем автоматические и ручные маркеры

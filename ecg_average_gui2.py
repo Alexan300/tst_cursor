@@ -445,8 +445,7 @@ class ECGApp(tk.Tk):
         # Подключаем события навигации matplotlib для сброса режимов
         self.canvas_raw.mpl_connect('key_press_event', self.on_navigation_event)
         
-        # Блокируем события matplotlib при активных режимах
-        self.canvas_raw.mpl_connect('button_press_event', self.block_matplotlib_events)
+        # Заменено на логику внутри основных обработчиков событий
         
 
 
@@ -774,14 +773,7 @@ class ECGApp(tk.Tk):
         if hasattr(event, 'key') and event.key in ['p', 'o', 'home', 'backspace']:
             self.reset_all_modes()
             
-    def block_matplotlib_events(self, event):
-        """Блокирует события matplotlib при активных режимах"""
-        # Если активен любой из наших режимов, блокируем события matplotlib
-        if any([self.manual_peak_mode, self.select_complex_mode, self.measurement_mode, 
-                self.marker_edit_mode, getattr(self, 'region_selector_active', False)]):
-            # Блокируем событие, не передавая его дальше
-            return 'break'
-        return None
+
         
 
                 
@@ -808,23 +800,20 @@ class ECGApp(tk.Tk):
         
     def disable_matplotlib_navigation(self):
         """Полностью отключает инструменты навигации matplotlib"""
-        # Принудительно устанавливаем режим "Home" (без навигации)
-        self.toolbar_raw.home()
-        
-        # Отключаем все инструменты навигации
-        self.toolbar_raw.pan()
-        self.toolbar_raw.zoom()
-        
-        # Принудительно отключаем обработчики событий
-        try:
-            # Отключаем обработчики событий навигации
-            self.canvas_raw.toolbar.pan()
-            self.canvas_raw.toolbar.zoom()
-        except:
-            pass
-        
         # Устанавливаем флаг, что навигация отключена
         self._navigation_disabled = True
+        
+        # Принудительно сбрасываем все активные режимы навигации
+        try:
+            # Отключаем режим панорамирования если активен
+            if hasattr(self.toolbar_raw, '_active') and self.toolbar_raw._active == 'PAN':
+                self.toolbar_raw.pan()
+            
+            # Отключаем режим зума если активен  
+            if hasattr(self.toolbar_raw, '_active') and self.toolbar_raw._active == 'ZOOM':
+                self.toolbar_raw.zoom()
+        except:
+            pass
         
         # Блокируем кнопки навигации в toolbar
         for child in self.toolbar_raw.winfo_children():
@@ -838,10 +827,6 @@ class ECGApp(tk.Tk):
         """Включает инструменты навигации matplotlib"""
         # Сбрасываем флаг отключения навигации
         self._navigation_disabled = False
-        
-        # Включаем инструменты навигации
-        self.toolbar_raw.pan()
-        self.toolbar_raw.zoom()
         
         # Разблокируем кнопки навигации в toolbar
         for child in self.toolbar_raw.winfo_children():
@@ -1360,7 +1345,9 @@ RR ИНТЕРВАЛЫ:
                     self.region_selector_active = False
                     self.region_selector_button.config(bg='lightgray', relief='raised')
                     self.enable_matplotlib_navigation()
-                    return
+            
+            # ВАЖНО: Блокируем дальнейшую обработку события matplotlib при активном режиме выделения региона
+            return
             
         # попытка редактирования region
         for idx, patch in enumerate(self.region_patches):
@@ -1469,6 +1456,10 @@ RR ИНТЕРВАЛЫ:
                 pass
 
     def on_motion(self, ev):
+        # Блокируем события matplotlib при активном режиме выделения региона
+        if getattr(self, 'region_selector_active', False):
+            return
+            
         if not self.resizing or ev.inaxes!=self.ax_raw:
             return
         patch, side, idx = self.resizing
@@ -1485,6 +1476,10 @@ RR ИНТЕРВАЛЫ:
         self.canvas_raw.draw()
 
     def on_release(self, ev):
+        # Блокируем события matplotlib при активном режиме выделения региона
+        if getattr(self, 'region_selector_active', False):
+            return
+            
         self.resizing = None
 
     def compute(self):
